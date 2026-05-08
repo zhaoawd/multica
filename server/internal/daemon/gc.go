@@ -262,13 +262,22 @@ func (d *Daemon) gcDecisionChat(ctx context.Context, taskDir string, meta *exece
 	status, err := d.client.GetChatSessionGCCheck(ctx, meta.ChatSessionID)
 	if err != nil {
 		if isAccessNotFound(err) {
-			// Hard delete (DeleteChatSession) is a real DELETE — a 404 here
-			// almost always means the user explicitly removed the session.
-			// We still gate on mtime because a daemon token scoped to a
-			// different workspace also gets 404; an active idle session
-			// (whose row exists but the daemon can't see it) must not be
-			// reclaimed inside the orphan-TTL window.
-			return d.orphanByMTime(taskDir, "chat session not accessible")
+			// 404 means the chat_session row is gone — DeleteChatSession is
+			// a real DELETE, so a hard delete propagates here as soon as
+			// the user clicks the button. This is the strongest reclaim
+			// signal we get and it's exactly acceptance criterion #3:
+			// reclaim within one GC cycle (≤ GCInterval), not 72h.
+			//
+			// We don't gate on mtime: every chat_session_id in a meta file
+			// was written by this daemon under its current token, so there
+			// is no cross-workspace probe to defend against.
+			d.logger.Info("gc: eligible for cleanup",
+				"dir", filepath.Base(taskDir),
+				"kind", "chat",
+				"chat_session", meta.ChatSessionID,
+				"reason", "session not accessible (hard-deleted)",
+			)
+			return gcActionClean
 		}
 		return gcActionSkip
 	}
