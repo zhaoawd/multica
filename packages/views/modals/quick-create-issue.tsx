@@ -31,7 +31,8 @@ import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import { formatShortcut, modKey, enterKey } from "@multica/core/platform";
 import type { Agent } from "@multica/core/types";
 import { ActorAvatar } from "../common/actor-avatar";
-import { ProjectIcon } from "../projects/components/project-icon";
+import { PillButton } from "../common/pill-button";
+import { ProjectPicker } from "../projects/components/project-picker";
 import { canAssignAgent } from "../issues/components/pickers/assignee-picker";
 import { useAuthStore } from "@multica/core/auth";
 import { memberListOptions } from "@multica/core/workspace/queries";
@@ -66,7 +67,6 @@ export function AgentCreatePanel({
   data?: Record<string, unknown> | null;
 }) {
   const { t } = useT("modals");
-  const { t: tProjects } = useT("projects");
   const workspaceName = useCurrentWorkspace()?.name;
   const wsId = useWorkspaceId();
   const userId = useAuthStore((s) => s.user?.id);
@@ -136,10 +136,6 @@ export function AgentCreatePanel({
     if (projectId === null || projects.length === 0) return;
     if (!projects.some((p) => p.id === projectId)) setProjectId(null);
   }, [projects, projectId]);
-  const selectedProject = useMemo(
-    () => projects.find((p) => p.id === projectId),
-    [projects, projectId],
-  );
 
   // Daemon CLI version gate. The agent-create flow needs the runtime's
   // bundled multica CLI to be ≥ MIN_QUICK_CREATE_CLI_VERSION; older
@@ -312,12 +308,8 @@ export function AgentCreatePanel({
           </button>
         </div>
 
-        {/* Agent + project pickers — share one row so the modal stays compact.
-            The project picker remembers the user's last pick across opens
-            (useQuickCreateStore.lastProjectId) so workspaces that primarily
-            ship into one project don't have to retype "in project A" on
-            every prompt. */}
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-5 pt-1 pb-2 shrink-0">
+        {/* Agent picker */}
+        <div className="px-5 pt-1 pb-2 shrink-0">
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
@@ -371,62 +363,6 @@ export function AgentCreatePanel({
               )}
             </DropdownMenuContent>
           </DropdownMenu>
-
-          {/* Project picker — visually subordinate to the agent picker (it's
-              the optional second target), placed on the same row so the
-              header stays one tight line. Hidden entirely when the workspace
-              has no projects — there is nothing to pick. */}
-          {projects.length > 0 && (
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={
-                  <button
-                    type="button"
-                    aria-label={t(($) => $.create_issue.agent.select_project_aria)}
-                    className="flex max-w-[14rem] items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer rounded-sm px-1.5 py-1 hover:bg-accent/60"
-                  >
-                    {selectedProject ? (
-                      <>
-                        <span>{t(($) => $.create_issue.agent.in_project)}</span>
-                        <span className="flex min-w-0 items-center gap-1.5 text-foreground">
-                          <ProjectIcon project={selectedProject} size="sm" />
-                          <span className="truncate">{selectedProject.title}</span>
-                        </span>
-                      </>
-                    ) : (
-                      <span>{t(($) => $.create_issue.agent.no_project)}</span>
-                    )}
-                  </button>
-                }
-              />
-              <DropdownMenuContent align="start" className="w-64 max-h-72 overflow-y-auto">
-                <DropdownMenuItem
-                  onClick={() => setProjectId(null)}
-                  className="flex items-center gap-2"
-                >
-                  <span className="flex-1 truncate">
-                    {tProjects(($) => $.picker.no_project)}
-                  </span>
-                  {projectId === null && (
-                    <Check className="size-3.5 text-muted-foreground" />
-                  )}
-                </DropdownMenuItem>
-                {projects.map((p) => (
-                  <DropdownMenuItem
-                    key={p.id}
-                    onClick={() => setProjectId(p.id)}
-                    className="flex items-center gap-2"
-                  >
-                    <ProjectIcon project={p} size="md" />
-                    <span className="flex-1 truncate">{p.title}</span>
-                    {projectId === p.id && (
-                      <Check className="size-3.5 text-muted-foreground" />
-                    )}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
         </div>
 
         {selectedAgent && versionBlocked && (
@@ -469,6 +405,21 @@ export function AgentCreatePanel({
         {error && (
           <div className="px-5 pb-2 text-xs text-destructive">{error}</div>
         )}
+
+        {/* Property toolbar — mirrors the manual panel's pill row so the
+            project pill sits in the same place across both modes. Agent mode
+            owns only the project (status / priority / assignee / due-date are
+            inferred from the prompt), so it's a single pill. The pick is
+            persisted per-workspace via useQuickCreateStore.lastProjectId so
+            users targeting one project skip retyping "in project X". */}
+        <div className="flex items-center gap-1.5 px-4 pb-2 shrink-0 flex-wrap">
+          <ProjectPicker
+            projectId={projectId}
+            onUpdate={(u) => setProjectId(u.project_id ?? null)}
+            triggerRender={<PillButton />}
+            align="start"
+          />
+        </div>
 
         {/* Footer */}
         <div className="flex flex-col gap-2 border-t px-4 py-3 shrink-0 sm:flex-row sm:items-center sm:justify-between">
