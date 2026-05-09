@@ -220,7 +220,7 @@ describe("AgentCreatePanel", () => {
   });
 
   it("loads the persisted prompt draft when no transient prompt is provided", () => {
-    renderPanel({ onClose: vi.fn() });
+    renderPanel({ onClose: vi.fn(), isExpanded: false, setIsExpanded: vi.fn() });
 
     expect(
       screen.getByPlaceholderText(
@@ -233,7 +233,7 @@ describe("AgentCreatePanel", () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
 
-    renderPanel({ onClose });
+    renderPanel({ onClose, isExpanded: false, setIsExpanded: vi.fn() });
 
     const editor = screen.getByPlaceholderText(
       'Tell the agent what to do, e.g. "let Bohan fix the inbox loading slowness in the Web project"',

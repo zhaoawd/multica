@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeftRight, Check, ChevronRight, X as XIcon } from "lucide-react";
+import { ArrowLeftRight, Check, ChevronRight, Maximize2, Minimize2, X as XIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { DialogTitle } from "@multica/ui/components/ui/dialog";
@@ -55,10 +55,17 @@ export function AgentCreatePanel({
   onClose,
   onSwitchMode,
   data,
+  isExpanded,
+  setIsExpanded,
 }: {
   onClose: () => void;
   onSwitchMode?: () => void;
   data?: Record<string, unknown> | null;
+  /** Lifted to the shell so DialogContent's mode-aware className can react —
+   *  same pattern as ManualCreatePanel. Shared across modes so the user's
+   *  expand preference persists when switching between agent and manual. */
+  isExpanded: boolean;
+  setIsExpanded: (v: boolean) => void;
 }) {
   const { t } = useT("modals");
   const workspaceName = useCurrentWorkspace()?.name;
@@ -263,16 +270,27 @@ export function AgentCreatePanel({
           {/* Native `title` instead of Base UI Tooltip — Tooltip opens on
               keyboard focus, and the dialog's focus trap briefly lands focus
               on the first focusable element on mount, causing the tooltip to
-              auto-pop every open. */}
-          <button
-            type="button"
-            onClick={onClose}
-            title={t(($) => $.common.close)}
-            aria-label={t(($) => $.common.close)}
-            className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
-          >
-            <XIcon className="size-4" />
-          </button>
+              auto-pop every open. Same workaround applies to expand. */}
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setIsExpanded(!isExpanded)}
+              title={isExpanded ? t(($) => $.common.collapse_tooltip) : t(($) => $.common.expand_tooltip)}
+              aria-label={isExpanded ? t(($) => $.common.collapse_tooltip) : t(($) => $.common.expand_tooltip)}
+              className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
+            >
+              {isExpanded ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              title={t(($) => $.common.close)}
+              aria-label={t(($) => $.common.close)}
+              className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
+            >
+              <XIcon className="size-4" />
+            </button>
+          </div>
         </div>
 
         {/* Agent picker */}
