@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 
 const mockQuickCreateIssue = vi.hoisted(() => vi.fn());
 const mockSetLastAgentId = vi.hoisted(() => vi.fn());
+const mockSetLastProjectId = vi.hoisted(() => vi.fn());
 const mockSetPrompt = vi.hoisted(() => vi.fn());
 const mockClearPrompt = vi.hoisted(() => vi.fn());
 const mockSetKeepOpen = vi.hoisted(() => vi.fn());
@@ -14,6 +15,8 @@ const mockToastSuccess = vi.hoisted(() => vi.fn());
 const mockQuickCreateStore = {
   lastAgentId: null as string | null,
   setLastAgentId: mockSetLastAgentId,
+  lastProjectId: null as string | null,
+  setLastProjectId: mockSetLastProjectId,
   prompt: "Persisted draft prompt",
   setPrompt: mockSetPrompt,
   clearPrompt: mockClearPrompt,
@@ -32,6 +35,8 @@ vi.mock("@tanstack/react-query", () => ({
         };
       case "runtimes":
         return { data: [{ id: "runtime-1", metadata: { cli_version: "1.2.3" } }] };
+      case "projects":
+        return { data: [] };
       default:
         return { data: [] };
     }
@@ -58,6 +63,10 @@ vi.mock("@multica/core/paths", () => ({
 vi.mock("@multica/core/workspace/queries", () => ({
   agentListOptions: () => ({ queryKey: ["agents"] }),
   memberListOptions: () => ({ queryKey: ["members"] }),
+}));
+
+vi.mock("@multica/core/projects/queries", () => ({
+  projectListOptions: () => ({ queryKey: ["projects"] }),
 }));
 
 vi.mock("@multica/core/issues/stores/quick-create-store", () => ({
@@ -249,10 +258,14 @@ describe("AgentCreatePanel", () => {
       expect(mockQuickCreateIssue).toHaveBeenCalledWith({
         agent_id: "agent-1",
         prompt: "New agent prompt",
+        project_id: undefined,
       });
     });
 
     expect(mockSetLastAgentId).toHaveBeenCalledWith("agent-1");
+    // No project picked → persisted project preference is cleared so the
+    // store stays in sync with the actual outgoing request.
+    expect(mockSetLastProjectId).toHaveBeenCalledWith(null);
     expect(mockClearPrompt).toHaveBeenCalled();
     expect(mockSetLastMode).toHaveBeenCalledWith("agent");
     expect(onClose).toHaveBeenCalled();

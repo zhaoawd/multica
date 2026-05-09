@@ -17,6 +17,7 @@ import { api, ApiError } from "@multica/core/api";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { agentListOptions } from "@multica/core/workspace/queries";
+import { projectListOptions } from "@multica/core/projects/queries";
 import { useQuickCreateStore } from "@multica/core/issues/stores/quick-create-store";
 import { useIssueDraftStore } from "@multica/core/issues/stores/draft-store";
 import { useCreateModeStore } from "@multica/core/issues/stores/create-mode-store";
@@ -30,6 +31,7 @@ import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import { formatShortcut, modKey, enterKey } from "@multica/core/platform";
 import type { Agent } from "@multica/core/types";
 import { ActorAvatar } from "../common/actor-avatar";
+import { ProjectIcon } from "../projects/components/project-icon";
 import { canAssignAgent } from "../issues/components/pickers/assignee-picker";
 import { useAuthStore } from "@multica/core/auth";
 import { memberListOptions } from "@multica/core/workspace/queries";
@@ -49,23 +51,28 @@ import { useT } from "../i18n";
 // animation flash — Base UI replays Popup enter/exit when DialogContent is
 // remounted, even inside a still-open Dialog Root.
 //
-// `onSwitchMode` is wired by the shell — the panel calls it (no payload from
-// agent → manual; the shared draft store carries description + agent).
+// `onSwitchMode` is wired by the shell — the panel calls it with an optional
+// carry payload (currently `project_id`). The shared draft store carries the
+// description + agent across the agent→manual flip; project_id rides through
+// the same carry channel manual→agent uses, so the manual panel reads it
+// from `data?.project_id` without a parallel store.
 export function AgentCreatePanel({
   onClose,
   onSwitchMode,
   data,
 }: {
   onClose: () => void;
-  onSwitchMode?: () => void;
+  onSwitchMode?: (carry?: Record<string, unknown> | null) => void;
   data?: Record<string, unknown> | null;
 }) {
   const { t } = useT("modals");
+  const { t: tProjects } = useT("projects");
   const workspaceName = useCurrentWorkspace()?.name;
   const wsId = useWorkspaceId();
   const userId = useAuthStore((s) => s.user?.id);
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
+  const { data: projects = [] } = useQuery(projectListOptions(wsId));
 
   const memberRole = useMemo(
     () => members.find((m) => m.user_id === userId)?.role,
@@ -83,6 +90,8 @@ export function AgentCreatePanel({
 
   const lastAgentId = useQuickCreateStore((s) => s.lastAgentId);
   const setLastAgentId = useQuickCreateStore((s) => s.setLastAgentId);
+  const lastProjectId = useQuickCreateStore((s) => s.lastProjectId);
+  const setLastProjectId = useQuickCreateStore((s) => s.setLastProjectId);
   const promptDraft = useQuickCreateStore((s) => s.prompt);
   const setPrompt = useQuickCreateStore((s) => s.setPrompt);
   const clearPrompt = useQuickCreateStore((s) => s.clearPrompt);
@@ -111,6 +120,25 @@ export function AgentCreatePanel({
   const selectedAgent = useMemo(
     () => visibleAgents.find((a) => a.id === agentId),
     [visibleAgents, agentId],
+  );
+
+  // Project selection — defaults to the last project the user picked in this
+  // workspace. `data?.project_id` lets the modal opener seed a one-shot
+  // override (e.g. a future "+ Issue" button on a project page); it does NOT
+  // replace the persisted default. We only clear a stale id once the query
+  // has actually resolved with at least one project — clearing on the empty
+  // initial render would wipe the persisted preference on every open.
+  const [projectId, setProjectId] = useState<string | null>(() => {
+    const seed = (data?.project_id as string | undefined) ?? lastProjectId;
+    return seed ?? null;
+  });
+  useEffect(() => {
+    if (projectId === null || projects.length === 0) return;
+    if (!projects.some((p) => p.id === projectId)) setProjectId(null);
+  }, [projects, projectId]);
+  const selectedProject = useMemo(
+    () => projects.find((p) => p.id === projectId),
+    [projects, projectId],
   );
 
   // Daemon CLI version gate. The agent-create flow needs the runtime's
@@ -173,8 +201,13 @@ export function AgentCreatePanel({
     setSubmitting(true);
     setError(null);
     try {
-      await api.quickCreateIssue({ agent_id: agentId, prompt: md });
+      await api.quickCreateIssue({
+        agent_id: agentId,
+        prompt: md,
+        project_id: projectId ?? undefined,
+      });
       setLastAgentId(agentId);
+      setLastProjectId(projectId);
       clearPrompt();
       setLastMode("agent");
       toast.success(t(($) => $.create_issue.agent.toast_sent), {
@@ -246,7 +279,11 @@ export function AgentCreatePanel({
         : {}),
     });
     setLastMode("manual");
-    onSwitchMode?.();
+    // Hand the picked project to the manual panel through the same `data`
+    // channel that already carries agent_id / parent_issue_id. The manual
+    // panel reads `data.project_id` on mount; this preserves the user's
+    // selection across the mode flip without piping a third store through.
+    onSwitchMode?.(projectId ? { project_id: projectId } : null);
   };
 
   return (
@@ -275,8 +312,12 @@ export function AgentCreatePanel({
           </button>
         </div>
 
-        {/* Agent picker */}
-        <div className="px-5 pt-1 pb-2 shrink-0">
+        {/* Agent + project pickers — share one row so the modal stays compact.
+            The project picker remembers the user's last pick across opens
+            (useQuickCreateStore.lastProjectId) so workspaces that primarily
+            ship into one project don't have to retype "in project A" on
+            every prompt. */}
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-5 pt-1 pb-2 shrink-0">
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
@@ -330,6 +371,62 @@ export function AgentCreatePanel({
               )}
             </DropdownMenuContent>
           </DropdownMenu>
+
+          {/* Project picker — visually subordinate to the agent picker (it's
+              the optional second target), placed on the same row so the
+              header stays one tight line. Hidden entirely when the workspace
+              has no projects — there is nothing to pick. */}
+          {projects.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label={t(($) => $.create_issue.agent.select_project_aria)}
+                    className="flex max-w-[14rem] items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer rounded-sm px-1.5 py-1 hover:bg-accent/60"
+                  >
+                    {selectedProject ? (
+                      <>
+                        <span>{t(($) => $.create_issue.agent.in_project)}</span>
+                        <span className="flex min-w-0 items-center gap-1.5 text-foreground">
+                          <ProjectIcon project={selectedProject} size="sm" />
+                          <span className="truncate">{selectedProject.title}</span>
+                        </span>
+                      </>
+                    ) : (
+                      <span>{t(($) => $.create_issue.agent.no_project)}</span>
+                    )}
+                  </button>
+                }
+              />
+              <DropdownMenuContent align="start" className="w-64 max-h-72 overflow-y-auto">
+                <DropdownMenuItem
+                  onClick={() => setProjectId(null)}
+                  className="flex items-center gap-2"
+                >
+                  <span className="flex-1 truncate">
+                    {tProjects(($) => $.picker.no_project)}
+                  </span>
+                  {projectId === null && (
+                    <Check className="size-3.5 text-muted-foreground" />
+                  )}
+                </DropdownMenuItem>
+                {projects.map((p) => (
+                  <DropdownMenuItem
+                    key={p.id}
+                    onClick={() => setProjectId(p.id)}
+                    className="flex items-center gap-2"
+                  >
+                    <ProjectIcon project={p} size="md" />
+                    <span className="flex-1 truncate">{p.title}</span>
+                    {projectId === p.id && (
+                      <Check className="size-3.5 text-muted-foreground" />
+                    )}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </div>
 
         {selectedAgent && versionBlocked && (

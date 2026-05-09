@@ -459,11 +459,17 @@ func (s *TaskService) EnqueueTaskForMention(ctx context.Context, issue db.Issue,
 // context column. The daemon detects this variant via Type == "quick_create"
 // and switches to the quick-create prompt template; the completion path
 // uses RequesterID + WorkspaceID to write the inbox notification.
+//
+// ProjectID is the optional project the user picked in the modal. When
+// non-empty the daemon claim handler resolves the project's title +
+// resources, and the prompt template instructs the agent to pass
+// `--project <uuid>` so the new issue lands in that project.
 type QuickCreateContext struct {
 	Type        string `json:"type"`
 	Prompt      string `json:"prompt"`
 	RequesterID string `json:"requester_id"`
 	WorkspaceID string `json:"workspace_id"`
+	ProjectID   string `json:"project_id,omitempty"`
 }
 
 // QuickCreateContextType marks a task as a quick-create job.
@@ -475,7 +481,11 @@ const QuickCreateContextType = "quick_create"
 // `multica issue create` call. Pre-validates that the agent is reachable
 // (not archived, has a runtime) so the API can reject up-front rather than
 // queue a task no one will ever claim.
-func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, requesterID pgtype.UUID, agentID pgtype.UUID, prompt string) (db.AgentTaskQueue, error) {
+//
+// projectID is optional (zero-valued pgtype.UUID when the user didn't pick
+// one). The handler is responsible for validating it belongs to the same
+// workspace before passing it in.
+func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, requesterID pgtype.UUID, agentID pgtype.UUID, prompt string, projectID pgtype.UUID) (db.AgentTaskQueue, error) {
 	agent, err := s.Queries.GetAgent(ctx, agentID)
 	if err != nil {
 		return db.AgentTaskQueue{}, fmt.Errorf("load agent: %w", err)
@@ -492,6 +502,9 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 		Prompt:      prompt,
 		RequesterID: util.UUIDToString(requesterID),
 		WorkspaceID: util.UUIDToString(workspaceID),
+	}
+	if projectID.Valid {
+		payload.ProjectID = util.UUIDToString(projectID)
 	}
 	contextJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -513,6 +526,7 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 		"agent_id", util.UUIDToString(agentID),
 		"requester_id", util.UUIDToString(requesterID),
 		"workspace_id", util.UUIDToString(workspaceID),
+		"project_id", payload.ProjectID,
 	)
 	// Match every other Enqueue* path: kick the daemon WS so the task
 	// gets claimed promptly instead of waiting for the next 30 s poll

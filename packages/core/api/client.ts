@@ -443,7 +443,7 @@ export class ApiClient {
     });
   }
 
-  async quickCreateIssue(data: { agent_id: string; prompt: string }): Promise<{ task_id: string }> {
+  async quickCreateIssue(data: { agent_id: string; prompt: string; project_id?: string | null }): Promise<{ task_id: string }> {
     return this.fetch("/api/issues/quick-create", {
       method: "POST",
       body: JSON.stringify(data),

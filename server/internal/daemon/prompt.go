@@ -76,8 +76,19 @@ func buildQuickCreatePrompt(task Task) string {
 		b.WriteString("    - When the user did NOT name an assignee, default to YOURSELF (the picker agent): pass `--assignee-id <your agent UUID>` (preferred) or `--assignee <your agent name>`. Never leave the issue unassigned.\n\n")
 	}
 
-	// fields to omit
-	b.WriteString("- **project**: omit. The platform will route the issue to the workspace default.\n")
+	// project — pinned by the modal when the user picked one, otherwise
+	// omitted so the platform routes to the workspace default. Always pass
+	// the UUID (never a name) so the issue lands in the right project even
+	// when several share a title.
+	if task.ProjectID != "" {
+		if task.ProjectTitle != "" {
+			fmt.Fprintf(&b, "- **project**: required for this run. Pass `--project %q` so the new issue lands in project %q (the user picked it in the quick-create modal). Do not infer a different project from the prompt text — the modal selection is authoritative.\n", task.ProjectID, task.ProjectTitle)
+		} else {
+			fmt.Fprintf(&b, "- **project**: required for this run. Pass `--project %q` so the new issue lands in the project the user picked in the quick-create modal. Do not infer a different project from the prompt text — the modal selection is authoritative.\n", task.ProjectID)
+		}
+	} else {
+		b.WriteString("- **project**: omit. The platform will route the issue to the workspace default.\n")
+	}
 	b.WriteString("- **status**: omit (defaults to `todo`).\n")
 	b.WriteString("- **attachments**: do NOT pass `--attachment`. The flag only accepts LOCAL file paths. Any image URL in the user input is already markdown — keep it inline in `--description` instead.\n\n")
 
