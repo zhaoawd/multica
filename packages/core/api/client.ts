@@ -334,6 +334,7 @@ export class ApiClient {
 
   async markOnboardingComplete(payload?: {
     completion_path?: OnboardingCompletionPath;
+    workspace_id?: string;
   }): Promise<User> {
     return this.fetch("/api/me/onboarding/complete", {
       method: "POST",
@@ -846,6 +847,7 @@ export class ApiClient {
     google_client_id?: string;
     posthog_key?: string;
     posthog_host?: string;
+    analytics_environment?: string;
   }> {
     return this.fetch("/api/config");
   }

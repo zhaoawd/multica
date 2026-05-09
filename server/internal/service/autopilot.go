@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -57,20 +58,24 @@ func (s *AutopilotService) DispatchAutopilot(
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
 	}
+	s.captureAutopilotRunStarted(autopilot, run, source)
 
 	switch autopilot.ExecutionMode {
 	case "create_issue":
 		if err := s.dispatchCreateIssue(ctx, autopilot, &run); err != nil {
 			s.failRun(ctx, run.ID, err.Error())
+			s.captureAutopilotRunFailed(autopilot, run, source, err.Error())
 			return &run, fmt.Errorf("dispatch create_issue: %w", err)
 		}
 	case "run_only":
 		if err := s.dispatchRunOnly(ctx, autopilot, &run); err != nil {
 			s.failRun(ctx, run.ID, err.Error())
+			s.captureAutopilotRunFailed(autopilot, run, source, err.Error())
 			return &run, fmt.Errorf("dispatch run_only: %w", err)
 		}
 	default:
 		s.failRun(ctx, run.ID, "unknown execution_mode: "+autopilot.ExecutionMode)
+		s.captureAutopilotRunFailed(autopilot, run, source, "unknown execution_mode: "+autopilot.ExecutionMode)
 		return &run, fmt.Errorf("unknown execution_mode: %s", autopilot.ExecutionMode)
 	}
 
@@ -160,6 +165,7 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 			"issue": issueToMap(issue, prefix),
 		},
 	})
+	s.captureIssueCreatedFromAutopilot(ap, run, issue)
 
 	// Enqueue agent task via the existing flow.
 	if _, err := s.TaskSvc.EnqueueTaskForIssue(ctx, issue); err != nil {
@@ -220,7 +226,7 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 	// (bypassing TaskService.Enqueue*), so without this the runtime
 	// would not get a wakeup and any cached "empty" verdict would
 	// stall the task until the TTL expired.
-	s.TaskSvc.NotifyTaskEnqueued(task)
+	s.TaskSvc.NotifyTaskEnqueued(ctx, task)
 
 	slog.Info("autopilot dispatched (run_only)",
 		"autopilot_id", util.UUIDToString(ap.ID),
@@ -240,28 +246,36 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 	if err != nil {
 		return // no active run linked to this issue
 	}
+	autopilot, err := s.Queries.GetAutopilot(ctx, run.AutopilotID)
+	if err != nil {
+		return
+	}
 
 	wsID := util.UUIDToString(issue.WorkspaceID)
 
 	switch issue.Status {
 	case "done", "in_review":
-		if _, err := s.Queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{
+		updatedRun, err := s.Queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{
 			ID: run.ID,
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("failed to complete autopilot run", "run_id", util.UUIDToString(run.ID), "error", err)
 			return
 		}
-		s.publishRunDone(wsID, run, "completed")
+		s.captureAutopilotRunCompleted(autopilot, updatedRun)
+		s.publishRunDone(wsID, updatedRun, "completed")
 	case "cancelled", "blocked":
 		reason := "issue " + issue.Status
-		if _, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
+		updatedRun, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
 			ID:            run.ID,
 			FailureReason: pgtype.Text{String: reason, Valid: true},
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("failed to fail autopilot run", "run_id", util.UUIDToString(run.ID), "error", err)
 			return
 		}
-		s.publishRunDone(wsID, run, "failed")
+		s.captureAutopilotRunFailed(autopilot, updatedRun, updatedRun.Source, reason)
+		s.publishRunDone(wsID, updatedRun, "failed")
 	}
 }
 
@@ -284,30 +298,33 @@ func (s *AutopilotService) SyncRunFromTask(ctx context.Context, task db.AgentTas
 
 	switch task.Status {
 	case "completed":
-		if _, err := s.Queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{
+		updatedRun, err := s.Queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{
 			ID:     run.ID,
 			Result: task.Result,
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("failed to complete autopilot run from task", "run_id", util.UUIDToString(run.ID), "error", err)
 			return
 		}
-		s.publishRunDone(wsID, run, "completed")
+		s.captureAutopilotRunCompleted(autopilot, updatedRun)
+		s.publishRunDone(wsID, updatedRun, "completed")
 	case "failed", "cancelled":
 		reason := "task " + task.Status
 		if task.Error.Valid {
 			reason = task.Error.String
 		}
-		if _, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
+		updatedRun, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
 			ID:            run.ID,
 			FailureReason: pgtype.Text{String: reason, Valid: true},
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("failed to fail autopilot run from task", "run_id", util.UUIDToString(run.ID), "error", err)
 			return
 		}
-		s.publishRunDone(wsID, run, "failed")
+		s.captureAutopilotRunFailed(autopilot, updatedRun, updatedRun.Source, reason)
+		s.publishRunDone(wsID, updatedRun, "failed")
 	}
 }
-
 
 func (s *AutopilotService) failRun(ctx context.Context, runID pgtype.UUID, reason string) {
 	if _, err := s.Queries.UpdateAutopilotRunFailed(ctx, db.UpdateAutopilotRunFailedParams{
@@ -329,6 +346,100 @@ func (s *AutopilotService) publishRunDone(workspaceID string, run db.AutopilotRu
 			"status":       status,
 		},
 	})
+}
+
+func (s *AutopilotService) captureIssueCreatedFromAutopilot(ap db.Autopilot, run *db.AutopilotRun, issue db.Issue) {
+	if s.TaskSvc == nil || s.TaskSvc.Analytics == nil {
+		return
+	}
+	s.TaskSvc.Analytics.Capture(analytics.IssueCreated(
+		autopilotActorID(ap),
+		util.UUIDToString(ap.WorkspaceID),
+		util.UUIDToString(issue.ID),
+		util.UUIDToString(ap.AssigneeID),
+		"",
+		util.UUIDToString(run.ID),
+		analytics.SourceAutopilot,
+	))
+}
+
+func (s *AutopilotService) captureAutopilotRunStarted(ap db.Autopilot, run db.AutopilotRun, triggerSource string) {
+	if s.TaskSvc == nil || s.TaskSvc.Analytics == nil {
+		return
+	}
+	s.TaskSvc.Analytics.Capture(analytics.AutopilotRunStarted(
+		autopilotActorID(ap),
+		util.UUIDToString(ap.WorkspaceID),
+		util.UUIDToString(ap.ID),
+		util.UUIDToString(run.ID),
+		util.UUIDToString(ap.AssigneeID),
+		triggerSource,
+	))
+}
+
+func (s *AutopilotService) captureAutopilotRunCompleted(ap db.Autopilot, run db.AutopilotRun) {
+	if s.TaskSvc == nil || s.TaskSvc.Analytics == nil {
+		return
+	}
+	s.TaskSvc.Analytics.Capture(analytics.AutopilotRunCompleted(
+		autopilotActorID(ap),
+		util.UUIDToString(ap.WorkspaceID),
+		util.UUIDToString(ap.ID),
+		util.UUIDToString(run.ID),
+		util.UUIDToString(ap.AssigneeID),
+		run.Source,
+		autopilotRunDurationMS(run),
+	))
+}
+
+func (s *AutopilotService) captureAutopilotRunFailed(ap db.Autopilot, run db.AutopilotRun, triggerSource, reason string) {
+	if s.TaskSvc == nil || s.TaskSvc.Analytics == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	s.TaskSvc.Analytics.Capture(analytics.AutopilotRunFailed(
+		autopilotActorID(ap),
+		util.UUIDToString(ap.WorkspaceID),
+		util.UUIDToString(ap.ID),
+		util.UUIDToString(run.ID),
+		util.UUIDToString(ap.AssigneeID),
+		triggerSource,
+		reason,
+		reason,
+		false,
+		autopilotRunDurationMS(run),
+	))
+}
+
+func autopilotActorID(ap db.Autopilot) string {
+	id := util.UUIDToString(ap.CreatedByID)
+	if ap.CreatedByType == "agent" && id != "" {
+		return "agent:" + id
+	}
+	if id != "" {
+		return id
+	}
+	return "system"
+}
+
+func autopilotRunDurationMS(run db.AutopilotRun) int64 {
+	if !run.CompletedAt.Valid {
+		return 0
+	}
+	start := run.TriggeredAt
+	if !start.Valid {
+		start = run.CreatedAt
+	}
+	if !start.Valid {
+		return 0
+	}
+	ms := run.CompletedAt.Time.Sub(start.Time).Milliseconds()
+	if ms < 0 {
+		return 0
+	}
+	return ms
 }
 
 // buildIssueDescription appends an autopilot system instruction to the

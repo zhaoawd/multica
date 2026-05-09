@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/mention"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -27,6 +28,7 @@ type TaskService struct {
 	TxStarter TxStarter
 	Hub       *realtime.Hub
 	Bus       *events.Bus
+	Analytics analytics.Client
 	Wakeup    TaskWakeupNotifier
 	// EmptyClaim caches "this runtime has no queued task" so the daemon
 	// poll path can skip a Postgres scan on the steady-state empty case.
@@ -98,6 +100,175 @@ func NewTaskService(q *db.Queries, tx TxStarter, hub *realtime.Hub, bus *events.
 	return &TaskService{Queries: q, TxStarter: tx, Hub: hub, Bus: bus, Wakeup: wakeup}
 }
 
+func (s *TaskService) captureTaskQueued(ctx context.Context, task db.AgentTaskQueue) {
+	s.captureTaskEvent(ctx, analytics.AgentTaskQueued(s.taskAnalyticsContext(ctx, task)))
+}
+
+func (s *TaskService) AnalyticsContextForTask(ctx context.Context, task db.AgentTaskQueue) analytics.TaskContext {
+	return s.taskAnalyticsContext(ctx, task)
+}
+
+func (s *TaskService) captureTaskStarted(ctx context.Context, task db.AgentTaskQueue) {
+	s.captureTaskEvent(ctx, analytics.AgentTaskStarted(s.taskAnalyticsContext(ctx, task)))
+}
+
+func (s *TaskService) captureTaskCompleted(ctx context.Context, task db.AgentTaskQueue) {
+	s.captureTaskEvent(ctx, analytics.AgentTaskCompleted(
+		s.taskAnalyticsContext(ctx, task),
+		taskDurationMS(task),
+	))
+}
+
+func (s *TaskService) captureTaskFailed(ctx context.Context, task db.AgentTaskQueue) {
+	failureReason := taskFailureReason(task)
+	s.captureTaskEvent(ctx, analytics.AgentTaskFailed(
+		s.taskAnalyticsContext(ctx, task),
+		taskDurationMS(task),
+		failureReason,
+		failureReason,
+		s.isFailureRecoverable(task),
+	))
+}
+
+func (s *TaskService) captureTaskCancelled(ctx context.Context, task db.AgentTaskQueue) {
+	s.captureTaskEvent(ctx, analytics.AgentTaskCancelled(
+		s.taskAnalyticsContext(ctx, task),
+		taskDurationMS(task),
+	))
+}
+
+func (s *TaskService) captureTaskEvent(ctx context.Context, event analytics.Event) {
+	if s.Analytics == nil {
+		return
+	}
+	if event.WorkspaceID == "" {
+		return
+	}
+	s.Analytics.Capture(event)
+}
+
+func (s *TaskService) taskAnalyticsContext(ctx context.Context, task db.AgentTaskQueue) analytics.TaskContext {
+	tc := analytics.TaskContext{
+		AgentID: util.UUIDToString(task.AgentID),
+		TaskID:  util.UUIDToString(task.ID),
+		Source:  analytics.SourceManual,
+	}
+	if task.IssueID.Valid {
+		tc.IssueID = util.UUIDToString(task.IssueID)
+	}
+	if task.ChatSessionID.Valid {
+		tc.ChatSessionID = util.UUIDToString(task.ChatSessionID)
+		tc.Source = analytics.SourceChat
+	}
+	if task.AutopilotRunID.Valid {
+		tc.AutopilotRunID = util.UUIDToString(task.AutopilotRunID)
+		tc.Source = analytics.SourceAutopilot
+	}
+
+	if task.RuntimeID.Valid {
+		if rt, err := s.Queries.GetAgentRuntime(ctx, task.RuntimeID); err == nil {
+			tc.WorkspaceID = util.UUIDToString(rt.WorkspaceID)
+			tc.RuntimeMode = rt.RuntimeMode
+			tc.Provider = rt.Provider
+		}
+	}
+	if tc.WorkspaceID == "" || tc.RuntimeMode == "" {
+		if agent, err := s.Queries.GetAgent(ctx, task.AgentID); err == nil {
+			if tc.WorkspaceID == "" {
+				tc.WorkspaceID = util.UUIDToString(agent.WorkspaceID)
+			}
+			if tc.RuntimeMode == "" {
+				tc.RuntimeMode = agent.RuntimeMode
+			}
+		}
+	}
+
+	if task.IssueID.Valid {
+		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
+			tc.WorkspaceID = util.UUIDToString(issue.WorkspaceID)
+			if issue.CreatorType == "member" {
+				tc.UserID = util.UUIDToString(issue.CreatorID)
+			}
+			if issue.OriginType.Valid {
+				switch issue.OriginType.String {
+				case "autopilot":
+					tc.Source = analytics.SourceAutopilot
+					if ap, err := s.Queries.GetAutopilot(ctx, issue.OriginID); err == nil {
+						if ap.CreatedByType == "member" {
+							tc.UserID = util.UUIDToString(ap.CreatedByID)
+						}
+					}
+				case "quick_create":
+					tc.Source = analytics.SourceManual
+				}
+			}
+		}
+	}
+	if task.ChatSessionID.Valid {
+		if cs, err := s.Queries.GetChatSession(ctx, task.ChatSessionID); err == nil {
+			tc.WorkspaceID = util.UUIDToString(cs.WorkspaceID)
+			tc.UserID = util.UUIDToString(cs.CreatorID)
+		}
+	}
+	if task.AutopilotRunID.Valid {
+		if run, err := s.Queries.GetAutopilotRun(ctx, task.AutopilotRunID); err == nil {
+			if ap, err := s.Queries.GetAutopilot(ctx, run.AutopilotID); err == nil {
+				tc.WorkspaceID = util.UUIDToString(ap.WorkspaceID)
+				if ap.CreatedByType == "member" {
+					tc.UserID = util.UUIDToString(ap.CreatedByID)
+				}
+			}
+		}
+	}
+	if qc, ok := s.parseQuickCreateContext(task); ok {
+		tc.WorkspaceID = qc.WorkspaceID
+		tc.UserID = qc.RequesterID
+		tc.Source = analytics.SourceManual
+	}
+	return tc
+}
+
+func taskDurationMS(task db.AgentTaskQueue) int64 {
+	if !task.CompletedAt.Valid {
+		return 0
+	}
+	start := task.CreatedAt
+	if task.StartedAt.Valid {
+		start = task.StartedAt
+	} else if task.DispatchedAt.Valid {
+		start = task.DispatchedAt
+	}
+	if !start.Valid {
+		return 0
+	}
+	ms := task.CompletedAt.Time.Sub(start.Time).Milliseconds()
+	if ms < 0 {
+		return 0
+	}
+	return ms
+}
+
+func taskFailureReason(task db.AgentTaskQueue) string {
+	if task.FailureReason.Valid && task.FailureReason.String != "" {
+		return task.FailureReason.String
+	}
+	return "agent_error"
+}
+
+func (s *TaskService) isFailureRecoverable(task db.AgentTaskQueue) bool {
+	reason := taskFailureReason(task)
+	if !retryableReasons[reason] {
+		return false
+	}
+	if task.Attempt >= task.MaxAttempts {
+		return false
+	}
+	if task.AutopilotRunID.Valid {
+		return false
+	}
+	return task.IssueID.Valid || task.ChatSessionID.Valid
+}
+
 // EnqueueTaskForIssue creates a queued task for an agent-assigned issue.
 // No context snapshot is stored — the agent fetches all data it needs at
 // runtime via the multica CLI.
@@ -161,7 +332,7 @@ func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, trig
 	// before the queued one (rare but unsafe-by-construction). Publishing
 	// in the desired observe-order makes correctness independent of timing.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
-	s.notifyTaskAvailable(task)
+	s.NotifyTaskEnqueued(ctx, task)
 	return task, nil
 }
 
@@ -199,7 +370,7 @@ func (s *TaskService) EnqueueTaskForMention(ctx context.Context, issue db.Issue,
 	slog.Info("mention task enqueued", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID))
 	// See EnqueueTaskForIssue for ordering rationale.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
-	s.notifyTaskAvailable(task)
+	s.NotifyTaskEnqueued(ctx, task)
 	return task, nil
 }
 
@@ -267,7 +438,7 @@ func (s *TaskService) EnqueueQuickCreateTask(ctx context.Context, workspaceID, r
 	// cycle. Without this the user perceives "quick create never
 	// triggered" because the modal closes immediately and the task
 	// sits in 'queued' until the next sleepWithContextOrWakeup tick.
-	s.notifyTaskAvailable(task)
+	s.NotifyTaskEnqueued(ctx, task)
 	return task, nil
 }
 
@@ -300,7 +471,7 @@ func (s *TaskService) EnqueueChatTask(ctx context.Context, chatSession db.ChatSe
 	slog.Info("chat task enqueued", "task_id", util.UUIDToString(task.ID), "chat_session_id", util.UUIDToString(chatSession.ID), "agent_id", util.UUIDToString(chatSession.AgentID))
 	// See EnqueueTaskForIssue for ordering rationale.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
-	s.notifyTaskAvailable(task)
+	s.NotifyTaskEnqueued(ctx, task)
 	return task, nil
 }
 
@@ -319,6 +490,7 @@ func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UU
 		return err
 	}
 	for _, t := range cancelled {
+		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
 	}
@@ -337,6 +509,7 @@ func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UU
 		return nil, err
 	}
 	for _, t := range cancelled {
+		s.captureTaskCancelled(ctx, t)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
 	}
 	// Reconcile once after the loop — agent transitions from
@@ -358,6 +531,7 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 		return err
 	}
 	for _, t := range cancelled {
+		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
 	}
@@ -370,8 +544,15 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 // that the tx might still roll back.
 func (s *TaskService) BroadcastCancelledTasks(ctx context.Context, cancelled []db.AgentTaskQueue) {
 	for _, t := range cancelled {
+		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+	}
+}
+
+func (s *TaskService) CaptureCancelledTasks(ctx context.Context, cancelled []db.AgentTaskQueue) {
+	for _, t := range cancelled {
+		s.captureTaskCancelled(ctx, t)
 	}
 }
 
@@ -391,6 +572,7 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 	}
 
 	slog.Info("task cancelled", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
+	s.captureTaskCancelled(ctx, task)
 
 	// Reconcile agent status
 	s.ReconcileAgentStatus(ctx, task.AgentID)
@@ -590,6 +772,7 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.Ag
 	}
 
 	slog.Info("task started", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
+	s.captureTaskStarted(ctx, task)
 	return &task, nil
 }
 
@@ -668,6 +851,7 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 	}
 
 	slog.Info("task completed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
+	s.captureTaskCompleted(ctx, task)
 
 	// Invariant: every completed issue task must have at least one agent
 	// comment on the issue, so the user always sees something when a run
@@ -820,6 +1004,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 	}
 
 	slog.Warn("task failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", errMsg, "failure_reason", failureReason)
+	s.captureTaskFailed(ctx, task)
 
 	// Auto-retry eligible failures (orphan, timeout, runtime_offline,
 	// runtime_recovery). The helper itself enforces attempt < max_attempts
@@ -944,7 +1129,7 @@ func (s *TaskService) MaybeRetryFailedTask(ctx context.Context, parent db.AgentT
 	// as EnqueueTaskFor*. Broadcast queued first, then notify the daemon —
 	// see EnqueueTaskForIssue for ordering rationale.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, child)
-	s.notifyTaskAvailable(child)
+	s.NotifyTaskEnqueued(ctx, child)
 	return &child, nil
 }
 
@@ -986,6 +1171,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, trigg
 		)
 	}
 	for _, t := range cancelled {
+		s.captureTaskCancelled(ctx, t)
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
 	}
@@ -1036,6 +1222,7 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 		if t.FailureReason.Valid && t.FailureReason.String != "" {
 			failureReason = t.FailureReason.String
 		}
+		s.captureTaskFailed(ctx, t)
 
 		workspaceID := ""
 		if t.IssueID.Valid {
@@ -1229,7 +1416,8 @@ func priorityToInt(p string) int32 {
 // row into agent_task_queue directly. Invalidates the empty-claim
 // cache and kicks the daemon WS so the new task is claimed without
 // waiting for the next poll.
-func (s *TaskService) NotifyTaskEnqueued(task db.AgentTaskQueue) {
+func (s *TaskService) NotifyTaskEnqueued(ctx context.Context, task db.AgentTaskQueue) {
+	s.captureTaskQueued(ctx, task)
 	s.notifyTaskAvailable(task)
 }
 

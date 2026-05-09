@@ -99,6 +99,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	}
 
 	taskSvc := service.NewTaskService(queries, txStarter, hub, bus, daemonHub)
+	taskSvc.Analytics = analyticsClient
 	return &Handler{
 		Queries:               queries,
 		DB:                    executor,
