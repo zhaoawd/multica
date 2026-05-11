@@ -34,18 +34,20 @@ const maxUploadSize = 100 << 20 // 100 MB
 // ---------------------------------------------------------------------------
 
 type AttachmentResponse struct {
-	ID           string  `json:"id"`
-	WorkspaceID  string  `json:"workspace_id"`
-	IssueID      *string `json:"issue_id"`
-	CommentID    *string `json:"comment_id"`
-	UploaderType string  `json:"uploader_type"`
-	UploaderID   string  `json:"uploader_id"`
-	Filename     string  `json:"filename"`
-	URL          string  `json:"url"`
-	DownloadURL  string  `json:"download_url"`
-	ContentType  string  `json:"content_type"`
-	SizeBytes    int64   `json:"size_bytes"`
-	CreatedAt    string  `json:"created_at"`
+	ID            string  `json:"id"`
+	WorkspaceID   string  `json:"workspace_id"`
+	IssueID       *string `json:"issue_id"`
+	CommentID     *string `json:"comment_id"`
+	ChatSessionID *string `json:"chat_session_id"`
+	ChatMessageID *string `json:"chat_message_id"`
+	UploaderType  string  `json:"uploader_type"`
+	UploaderID    string  `json:"uploader_id"`
+	Filename      string  `json:"filename"`
+	URL           string  `json:"url"`
+	DownloadURL   string  `json:"download_url"`
+	ContentType   string  `json:"content_type"`
+	SizeBytes     int64   `json:"size_bytes"`
+	CreatedAt     string  `json:"created_at"`
 }
 
 func (h *Handler) attachmentToResponse(a db.Attachment) AttachmentResponse {
@@ -71,6 +73,14 @@ func (h *Handler) attachmentToResponse(a db.Attachment) AttachmentResponse {
 	if a.CommentID.Valid {
 		s := uuidToString(a.CommentID)
 		resp.CommentID = &s
+	}
+	if a.ChatSessionID.Valid {
+		s := uuidToString(a.ChatSessionID)
+		resp.ChatSessionID = &s
+	}
+	if a.ChatMessageID.Valid {
+		s := uuidToString(a.ChatMessageID)
+		resp.ChatMessageID = &s
 	}
 	return resp
 }
@@ -213,6 +223,16 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			params.CommentID = comment.ID
+		}
+		if chatSessionID := r.FormValue("chat_session_id"); chatSessionID != "" {
+			// Re-use the existing private-agent gate so the user can still
+			// reach this session — covers role downgrade and agent
+			// visibility flips. The gate writes 4xx on failure.
+			session, ok := h.gateChatSessionForUser(w, r, userID, workspaceID, chatSessionID)
+			if !ok {
+				return
+			}
+			params.ChatSessionID = session.ID
 		}
 
 		link, err := h.Storage.Upload(r.Context(), key, data, contentType, header.Filename)
