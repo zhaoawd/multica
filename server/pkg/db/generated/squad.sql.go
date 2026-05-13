@@ -43,6 +43,35 @@ func (q *Queries) AddSquadMember(ctx context.Context, arg AddSquadMemberParams) 
 	return i, err
 }
 
+const archiveSquad = `-- name: ArchiveSquad :one
+UPDATE squad SET archived_at = now(), archived_by = $2, updated_at = now()
+WHERE id = $1
+RETURNING id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at, archived_at, archived_by
+`
+
+type ArchiveSquadParams struct {
+	ID         pgtype.UUID `json:"id"`
+	ArchivedBy pgtype.UUID `json:"archived_by"`
+}
+
+func (q *Queries) ArchiveSquad(ctx context.Context, arg ArchiveSquadParams) (Squad, error) {
+	row := q.db.QueryRow(ctx, archiveSquad, arg.ID, arg.ArchivedBy)
+	var i Squad
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.Description,
+		&i.LeaderID,
+		&i.CreatorID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+	)
+	return i, err
+}
+
 const countSquadMembers = `-- name: CountSquadMembers :one
 SELECT count(*) FROM squad_member WHERE squad_id = $1
 `
@@ -57,7 +86,7 @@ func (q *Queries) CountSquadMembers(ctx context.Context, squadID pgtype.UUID) (i
 const createSquad = `-- name: CreateSquad :one
 INSERT INTO squad (workspace_id, name, description, leader_id, creator_id)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at
+RETURNING id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at, archived_at, archived_by
 `
 
 type CreateSquadParams struct {
@@ -86,6 +115,8 @@ func (q *Queries) CreateSquad(ctx context.Context, arg CreateSquadParams) (Squad
 		&i.CreatorID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
 	)
 	return i, err
 }
@@ -128,17 +159,8 @@ func (q *Queries) CreateSquadActivityLog(ctx context.Context, arg CreateSquadAct
 	return i, err
 }
 
-const deleteSquad = `-- name: DeleteSquad :exec
-DELETE FROM squad WHERE id = $1
-`
-
-func (q *Queries) DeleteSquad(ctx context.Context, id pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, deleteSquad, id)
-	return err
-}
-
 const getSquad = `-- name: GetSquad :one
-SELECT id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at FROM squad WHERE id = $1
+SELECT id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at, archived_at, archived_by FROM squad WHERE id = $1
 `
 
 func (q *Queries) GetSquad(ctx context.Context, id pgtype.UUID) (Squad, error) {
@@ -153,12 +175,14 @@ func (q *Queries) GetSquad(ctx context.Context, id pgtype.UUID) (Squad, error) {
 		&i.CreatorID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
 	)
 	return i, err
 }
 
 const getSquadByAssignee = `-- name: GetSquadByAssignee :one
-SELECT s.id, s.workspace_id, s.name, s.description, s.leader_id, s.creator_id, s.created_at, s.updated_at FROM squad s WHERE s.id = $1 AND s.workspace_id = $2
+SELECT s.id, s.workspace_id, s.name, s.description, s.leader_id, s.creator_id, s.created_at, s.updated_at, s.archived_at, s.archived_by FROM squad s WHERE s.id = $1 AND s.workspace_id = $2
 `
 
 type GetSquadByAssigneeParams struct {
@@ -179,12 +203,14 @@ func (q *Queries) GetSquadByAssignee(ctx context.Context, arg GetSquadByAssignee
 		&i.CreatorID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
 	)
 	return i, err
 }
 
 const getSquadInWorkspace = `-- name: GetSquadInWorkspace :one
-SELECT id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at FROM squad WHERE id = $1 AND workspace_id = $2
+SELECT id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at, archived_at, archived_by FROM squad WHERE id = $1 AND workspace_id = $2
 `
 
 type GetSquadInWorkspaceParams struct {
@@ -204,6 +230,8 @@ func (q *Queries) GetSquadInWorkspace(ctx context.Context, arg GetSquadInWorkspa
 		&i.CreatorID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
 	)
 	return i, err
 }
@@ -226,6 +254,41 @@ func (q *Queries) IsSquadMember(ctx context.Context, arg IsSquadMemberParams) (b
 	var is_member bool
 	err := row.Scan(&is_member)
 	return is_member, err
+}
+
+const listAllSquads = `-- name: ListAllSquads :many
+SELECT id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at, archived_at, archived_by FROM squad WHERE workspace_id = $1 ORDER BY created_at ASC
+`
+
+func (q *Queries) ListAllSquads(ctx context.Context, workspaceID pgtype.UUID) ([]Squad, error) {
+	rows, err := q.db.Query(ctx, listAllSquads, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Squad{}
+	for rows.Next() {
+		var i Squad
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.Name,
+			&i.Description,
+			&i.LeaderID,
+			&i.CreatorID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ArchivedAt,
+			&i.ArchivedBy,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listSquadActivityLogs = `-- name: ListSquadActivityLogs :many
@@ -301,7 +364,7 @@ func (q *Queries) ListSquadMembers(ctx context.Context, squadID pgtype.UUID) ([]
 }
 
 const listSquads = `-- name: ListSquads :many
-SELECT id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at FROM squad WHERE workspace_id = $1 ORDER BY created_at ASC
+SELECT id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at, archived_at, archived_by FROM squad WHERE workspace_id = $1 AND archived_at IS NULL ORDER BY created_at ASC
 `
 
 func (q *Queries) ListSquads(ctx context.Context, workspaceID pgtype.UUID) ([]Squad, error) {
@@ -322,6 +385,8 @@ func (q *Queries) ListSquads(ctx context.Context, workspaceID pgtype.UUID) ([]Sq
 			&i.CreatorID,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ArchivedAt,
+			&i.ArchivedBy,
 		); err != nil {
 			return nil, err
 		}
@@ -334,7 +399,7 @@ func (q *Queries) ListSquads(ctx context.Context, workspaceID pgtype.UUID) ([]Sq
 }
 
 const listSquadsByMember = `-- name: ListSquadsByMember :many
-SELECT s.id, s.workspace_id, s.name, s.description, s.leader_id, s.creator_id, s.created_at, s.updated_at FROM squad s
+SELECT s.id, s.workspace_id, s.name, s.description, s.leader_id, s.creator_id, s.created_at, s.updated_at, s.archived_at, s.archived_by FROM squad s
 JOIN squad_member sm ON sm.squad_id = s.id
 WHERE s.workspace_id = $1 AND sm.member_type = $2 AND sm.member_id = $3
 ORDER BY s.created_at ASC
@@ -365,6 +430,8 @@ func (q *Queries) ListSquadsByMember(ctx context.Context, arg ListSquadsByMember
 			&i.CreatorID,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ArchivedAt,
+			&i.ArchivedBy,
 		); err != nil {
 			return nil, err
 		}
@@ -415,7 +482,7 @@ UPDATE squad SET
     leader_id = COALESCE($4, leader_id),
     updated_at = now()
 WHERE id = $1
-RETURNING id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at
+RETURNING id, workspace_id, name, description, leader_id, creator_id, created_at, updated_at, archived_at, archived_by
 `
 
 type UpdateSquadParams struct {
@@ -442,6 +509,8 @@ func (q *Queries) UpdateSquad(ctx context.Context, arg UpdateSquadParams) (Squad
 		&i.CreatorID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
 	)
 	return i, err
 }

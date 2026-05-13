@@ -15,14 +15,16 @@ import (
 // ── Response types ──────────────────────────────────────────────────────────
 
 type SquadResponse struct {
-	ID          string `json:"id"`
-	WorkspaceID string `json:"workspace_id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	LeaderID    string `json:"leader_id"`
-	CreatorID   string `json:"creator_id"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	ID          string  `json:"id"`
+	WorkspaceID string  `json:"workspace_id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	LeaderID    string  `json:"leader_id"`
+	CreatorID   string  `json:"creator_id"`
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
+	ArchivedAt  *string `json:"archived_at"`
+	ArchivedBy  *string `json:"archived_by"`
 }
 
 type SquadMemberResponse struct {
@@ -57,6 +59,8 @@ func squadToResponse(s db.Squad) SquadResponse {
 		CreatorID:   uuidToString(s.CreatorID),
 		CreatedAt:   timestampToString(s.CreatedAt),
 		UpdatedAt:   timestampToString(s.UpdatedAt),
+		ArchivedAt:  timestampToPtr(s.ArchivedAt),
+		ArchivedBy:  uuidToPtr(s.ArchivedBy),
 	}
 }
 
@@ -296,6 +300,11 @@ func (h *Handler) DeleteSquad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if squad.ArchivedAt.Valid {
+		writeError(w, http.StatusBadRequest, "squad is already archived")
+		return
+	}
+
 	// Transfer issues assigned to this squad to the leader agent.
 	if err := h.Queries.TransferSquadAssignees(r.Context(), db.TransferSquadAssigneesParams{
 		AssigneeID:   squad.ID,
@@ -304,12 +313,18 @@ func (h *Handler) DeleteSquad(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("transfer squad assignees failed", "squad_id", uuidToString(squad.ID), "error", err)
 	}
 
-	if err := h.Queries.DeleteSquad(r.Context(), squad.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to delete squad")
+	userID := requestUserID(r)
+	userUUID, _ := parseUUIDOrBadRequest(w, userID, "user_id")
+
+	if _, err := h.Queries.ArchiveSquad(r.Context(), db.ArchiveSquadParams{
+		ID:         squad.ID,
+		ArchivedBy: userUUID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to archive squad")
 		return
 	}
 
-	h.publish(protocol.EventSquadDeleted, workspaceID, "member", requestUserID(r), map[string]any{
+	h.publish(protocol.EventSquadDeleted, workspaceID, "member", userID, map[string]any{
 		"squad_id":  uuidToString(squad.ID),
 		"leader_id": uuidToString(squad.LeaderID),
 	})

@@ -457,6 +457,8 @@ type Squad struct {
 	CreatorID   pgtype.UUID        `json:"creator_id"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	ArchivedAt  pgtype.Timestamptz `json:"archived_at"`
+	ArchivedBy  pgtype.UUID        `json:"archived_by"`
 }
 
 type SquadActivityLog struct {

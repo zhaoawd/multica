@@ -10,6 +10,9 @@ SELECT * FROM squad WHERE id = $1;
 SELECT * FROM squad WHERE id = $1 AND workspace_id = $2;
 
 -- name: ListSquads :many
+SELECT * FROM squad WHERE workspace_id = $1 AND archived_at IS NULL ORDER BY created_at ASC;
+
+-- name: ListAllSquads :many
 SELECT * FROM squad WHERE workspace_id = $1 ORDER BY created_at ASC;
 
 -- name: UpdateSquad :one
@@ -21,8 +24,10 @@ UPDATE squad SET
 WHERE id = $1
 RETURNING *;
 
--- name: DeleteSquad :exec
-DELETE FROM squad WHERE id = $1;
+-- name: ArchiveSquad :one
+UPDATE squad SET archived_at = now(), archived_by = $2, updated_at = now()
+WHERE id = $1
+RETURNING *;
 
 -- name: AddSquadMember :one
 INSERT INTO squad_member (squad_id, member_type, member_id, role)
