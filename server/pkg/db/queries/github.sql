@@ -45,11 +45,13 @@ RETURNING id, workspace_id;
 INSERT INTO github_pull_request (
     workspace_id, installation_id, repo_owner, repo_name, pr_number,
     title, state, html_url, branch, author_login, author_avatar_url,
-    merged_at, closed_at, pr_created_at, pr_updated_at
+    merged_at, closed_at, pr_created_at, pr_updated_at,
+    head_sha, mergeable_state
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, $8, sqlc.narg('branch'), sqlc.narg('author_login'), sqlc.narg('author_avatar_url'),
-    sqlc.narg('merged_at'), sqlc.narg('closed_at'), $9, $10
+    sqlc.narg('merged_at'), sqlc.narg('closed_at'), $9, $10,
+    $11, sqlc.narg('mergeable_state')
 )
 ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
     installation_id = EXCLUDED.installation_id,
@@ -62,6 +64,8 @@ ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
     merged_at = EXCLUDED.merged_at,
     closed_at = EXCLUDED.closed_at,
     pr_updated_at = EXCLUDED.pr_updated_at,
+    head_sha = EXCLUDED.head_sha,
+    mergeable_state = EXCLUDED.mergeable_state,
     updated_at = now()
 RETURNING *;
 
@@ -69,10 +73,54 @@ RETURNING *;
 SELECT * FROM github_pull_request
 WHERE workspace_id = $1 AND repo_owner = $2 AND repo_name = $3 AND pr_number = $4;
 
+-- name: GetGitHubPullRequestByRepoNumber :one
+-- Looks up a PR row across all workspaces by (owner, repo, number). Used by
+-- the check_suite webhook which doesn't carry a workspace id.
+SELECT * FROM github_pull_request
+WHERE repo_owner = $1 AND repo_name = $2 AND pr_number = $3;
+
 -- name: ListPullRequestsByIssue :many
-SELECT pr.*
+-- Returns the issue's linked PRs with the aggregated check-suite counts for
+-- the PR's CURRENT head SHA. Per-app latest suite is selected first so a
+-- single app firing multiple suites on the same head doesn't get counted
+-- N times. Late-arriving suites for an OLD head are stored but excluded by
+-- the head_sha filter, so they can't override the new head's pending view.
+WITH per_app_latest AS (
+    SELECT DISTINCT ON (cs.pr_id, cs.app_id)
+        cs.pr_id, cs.app_id, cs.conclusion, cs.status
+    FROM github_pull_request_check_suite cs
+    JOIN github_pull_request pr ON pr.id = cs.pr_id
+    WHERE cs.head_sha = pr.head_sha AND pr.head_sha <> ''
+    ORDER BY cs.pr_id, cs.app_id, cs.updated_at DESC
+),
+checks AS (
+    SELECT
+        pr_id,
+        COUNT(*)::bigint AS total,
+        SUM(CASE WHEN status = 'completed' AND conclusion IN
+                ('failure','cancelled','timed_out','action_required','startup_failure','stale')
+            THEN 1 ELSE 0 END)::bigint AS failed,
+        SUM(CASE WHEN status = 'completed' AND conclusion IN
+                ('success','neutral','skipped')
+            THEN 1 ELSE 0 END)::bigint AS passed,
+        SUM(CASE WHEN status <> 'completed' OR conclusion IS NULL
+            THEN 1 ELSE 0 END)::bigint AS pending
+    FROM per_app_latest
+    GROUP BY pr_id
+)
+SELECT
+    pr.id, pr.workspace_id, pr.installation_id, pr.repo_owner, pr.repo_name,
+    pr.pr_number, pr.title, pr.state, pr.html_url, pr.branch, pr.author_login,
+    pr.author_avatar_url, pr.merged_at, pr.closed_at, pr.pr_created_at,
+    pr.pr_updated_at, pr.head_sha, pr.mergeable_state,
+    pr.created_at, pr.updated_at,
+    COALESCE(c.total, 0)::bigint   AS checks_total,
+    COALESCE(c.passed, 0)::bigint  AS checks_passed,
+    COALESCE(c.failed, 0)::bigint  AS checks_failed,
+    COALESCE(c.pending, 0)::bigint AS checks_pending
 FROM github_pull_request pr
 JOIN issue_pull_request ipr ON ipr.pull_request_id = pr.id
+LEFT JOIN checks c ON c.pr_id = pr.id
 WHERE ipr.issue_id = $1
 ORDER BY pr.pr_created_at DESC;
 
@@ -94,6 +142,30 @@ FROM github_pull_request pr
 JOIN issue_pull_request ipr ON ipr.pull_request_id = pr.id
 WHERE ipr.issue_id = $1
   AND pr.id <> $2;
+
+-- =====================
+-- GitHub PR check suite
+-- =====================
+
+-- name: UpsertPullRequestCheckSuite :exec
+-- Upserts a single check_suite row keyed by (pr_id, suite_id). The WHERE
+-- clause on the DO UPDATE branch prevents a late-arriving older event from
+-- overwriting a newer one — same-PR/same-suite ordering protection. Late
+-- events targeting an old head still land here (their head_sha is stored
+-- on the row); the head_sha filter in ListPullRequestsByIssue keeps them
+-- out of the current aggregate.
+INSERT INTO github_pull_request_check_suite (
+    pr_id, suite_id, head_sha, app_id, conclusion, status, updated_at
+) VALUES (
+    $1, $2, $3, $4, sqlc.narg('conclusion'), $5, $6
+)
+ON CONFLICT (pr_id, suite_id) DO UPDATE SET
+    head_sha   = EXCLUDED.head_sha,
+    app_id     = EXCLUDED.app_id,
+    conclusion = EXCLUDED.conclusion,
+    status     = EXCLUDED.status,
+    updated_at = EXCLUDED.updated_at
+WHERE EXCLUDED.updated_at >= github_pull_request_check_suite.updated_at;
 
 -- =====================
 -- Issue ↔ Pull Request link

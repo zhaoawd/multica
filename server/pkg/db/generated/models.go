@@ -272,6 +272,18 @@ type GithubPullRequest struct {
 	PrUpdatedAt     pgtype.Timestamptz `json:"pr_updated_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	HeadSha         string             `json:"head_sha"`
+	MergeableState  pgtype.Text        `json:"mergeable_state"`
+}
+
+type GithubPullRequestCheckSuite struct {
+	PrID       pgtype.UUID        `json:"pr_id"`
+	SuiteID    int64              `json:"suite_id"`
+	HeadSha    string             `json:"head_sha"`
+	AppID      int64              `json:"app_id"`
+	Conclusion pgtype.Text        `json:"conclusion"`
+	Status     string             `json:"status"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 }
 
 type InboxItem struct {
