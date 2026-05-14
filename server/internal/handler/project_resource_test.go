@@ -215,6 +215,9 @@ func TestIsValidGitRepoURL(t *testing.T) {
 		"ftp://example.com/repo",        // unsupported scheme
 		"file:///tmp/repo",              // unsupported scheme
 		"some random text with spaces",
+		"github.com:org/repo@branch",    // '@' after ':' belongs to the path, not user
+		"foo:bar@baz",                   // '@' after ':' with no scheme
+		":foo/bar",                      // leading ':' with no host
 	}
 	for _, s := range good {
 		if !isValidGitRepoURL(s) {

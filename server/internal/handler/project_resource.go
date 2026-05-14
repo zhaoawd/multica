@@ -114,13 +114,23 @@ func isValidGitRepoURL(s string) bool {
 	if strings.Contains(s, " ") || strings.Contains(s, "://") {
 		return false
 	}
-	at := strings.Index(s, "@")
 	colon := strings.Index(s, ":")
 	if colon <= 0 || colon == len(s)-1 {
 		return false
 	}
-	// Host segment is between '@' (if present) and the first ':'.
-	host := s[at+1 : colon]
+	// In scp-like ssh shorthand `[user@]host:path`, `@` is only meaningful
+	// as a user separator before the first ':'. If '@' appears at or after
+	// the colon it is not the user separator — reject as malformed rather
+	// than guess (and avoid a slice-bounds panic from blindly slicing).
+	at := strings.Index(s, "@")
+	if at >= colon {
+		return false
+	}
+	hostStart := 0
+	if at >= 0 {
+		hostStart = at + 1
+	}
+	host := s[hostStart:colon]
 	path := s[colon+1:]
 	if host == "" || path == "" {
 		return false
