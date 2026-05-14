@@ -2142,6 +2142,14 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if env.CodexHome != "" {
 		agentEnv["CODEX_HOME"] = env.CodexHome
 	}
+	// Point OpenClaw at the per-task synthesized config. The config pins
+	// agents.defaults.workspace (and any agents.list[].workspace) to the
+	// task workdir, so the CLI's native skill scanner picks up the per-task
+	// skills written under {workDir}/skills/. Falls back silently when the
+	// preparer didn't run (non-openclaw provider, or write failure).
+	if env.OpenclawConfigPath != "" {
+		agentEnv["OPENCLAW_CONFIG_PATH"] = env.OpenclawConfigPath
+	}
 	// Inject user-configured custom environment variables (e.g. ANTHROPIC_API_KEY,
 	// ANTHROPIC_BASE_URL for router/proxy mode, or CLAUDE_CODE_USE_BEDROCK for
 	// Bedrock). These are set per-agent via the agent settings UI.
@@ -2723,7 +2731,7 @@ func isBlockedEnvKey(key string) bool {
 		return true
 	}
 	switch upper {
-	case "HOME", "PATH", "USER", "SHELL", "TERM", "CODEX_HOME":
+	case "HOME", "PATH", "USER", "SHELL", "TERM", "CODEX_HOME", "OPENCLAW_CONFIG_PATH":
 		return true
 	}
 	return false

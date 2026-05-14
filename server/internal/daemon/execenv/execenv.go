@@ -84,6 +84,11 @@ type Environment struct {
 	WorkDir string
 	// CodexHome is the path to the per-task CODEX_HOME directory (set only for codex provider).
 	CodexHome string
+	// OpenclawConfigPath is the path to the per-task synthesized OpenClaw
+	// config (set only for openclaw provider). The daemon exports this as
+	// OPENCLAW_CONFIG_PATH on the openclaw subprocess so its native skill
+	// scanner pins workspaceDir to WorkDir.
+	OpenclawConfigPath string
 
 	logger *slog.Logger // for cleanup logging
 }
@@ -152,6 +157,20 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		env.CodexHome = codexHome
 	}
 
+	// For OpenClaw, synthesize a per-task config that pins workspace to
+	// workDir. The skill scanner then reads {workDir}/skills/ (written by
+	// writeContextFiles above). Best-effort: a write failure logs and the
+	// agent falls back to the inline runtime brief, which still references
+	// the skill file paths so they're not lost.
+	if params.Provider == "openclaw" {
+		cfgPath, err := prepareOpenclawConfig(envRoot, workDir)
+		if err != nil {
+			logger.Warn("execenv: prepare openclaw config failed", "error", err)
+		} else {
+			env.OpenclawConfigPath = cfgPath
+		}
+	}
+
 	logger.Info("execenv: prepared env", "root", envRoot, "repos_available", len(params.Task.Repos))
 	return env, nil
 }
@@ -190,6 +209,17 @@ func Reuse(workDir, provider, codexVersion string, task TaskContextForEnv, logge
 			if err := hydrateCodexSkills(codexHome, task.AgentSkills, logger); err != nil {
 				logger.Warn("execenv: refresh codex skills failed", "error", err)
 			}
+		}
+	}
+
+	// Refresh the per-task OpenClaw config on reuse — the user may have
+	// added/removed agents or rotated providers since the prior task ran,
+	// and the workspace override always re-targets the current workDir.
+	if provider == "openclaw" {
+		if cfgPath, err := prepareOpenclawConfig(env.RootDir, workDir); err != nil {
+			logger.Warn("execenv: refresh openclaw config failed", "error", err)
+		} else {
+			env.OpenclawConfigPath = cfgPath
 		}
 	}
 

@@ -802,13 +802,13 @@ func TestWriteContextFilesOpencodeNativeSkills(t *testing.T) {
 	}
 }
 
-// OpenClaw scans its own workspaceDir (resolved from the openclaw config,
-// not the task workdir) and never reads {workDir}/.openclaw/skills/. Until
-// per-task workspace integration lands, openclaw skills fall back to
-// .agent_context/skills/ — the meta AGENTS.md content references that path
-// explicitly. This test fails closed if someone re-adds a dead-drop case to
-// resolveSkillsDir.
-func TestWriteContextFilesOpenclawFallsBackToAgentContext(t *testing.T) {
+// OpenClaw's native skill scanner reads {workspaceDir}/skills/. The daemon
+// pairs writeContextFiles with a per-task synthesized openclaw-config.json
+// (see openclaw_config.go) that pins agents.defaults.workspace to workDir,
+// so writing skills to {workDir}/skills/ is what the CLI actually scans.
+// This test pins the post-MUL-2219 write path; the previous fallback into
+// .agent_context/skills/ was a dead drop the openclaw scanner never read.
+func TestWriteContextFilesOpenclawNativeSkills(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
@@ -829,15 +829,15 @@ func TestWriteContextFilesOpenclawFallsBackToAgentContext(t *testing.T) {
 		t.Fatalf("writeContextFiles failed: %v", err)
 	}
 
-	skillMd, err := os.ReadFile(filepath.Join(dir, ".agent_context", "skills", "go-conventions", "SKILL.md"))
+	skillMd, err := os.ReadFile(filepath.Join(dir, "skills", "go-conventions", "SKILL.md"))
 	if err != nil {
-		t.Fatalf("failed to read .agent_context/skills/go-conventions/SKILL.md: %v", err)
+		t.Fatalf("failed to read skills/go-conventions/SKILL.md: %v", err)
 	}
 	if !strings.Contains(string(skillMd), "Follow Go conventions.") {
 		t.Error("SKILL.md missing content")
 	}
 
-	supportFile, err := os.ReadFile(filepath.Join(dir, ".agent_context", "skills", "go-conventions", "templates", "example.go"))
+	supportFile, err := os.ReadFile(filepath.Join(dir, "skills", "go-conventions", "templates", "example.go"))
 	if err != nil {
 		t.Fatalf("failed to read supporting file: %v", err)
 	}
@@ -845,6 +845,10 @@ func TestWriteContextFilesOpenclawFallsBackToAgentContext(t *testing.T) {
 		t.Errorf("supporting file content = %q, want %q", string(supportFile), "package main")
 	}
 
+	// The pre-MUL-2219 fallback path must NOT be written: openclaw never scans it.
+	if _, err := os.Stat(filepath.Join(dir, ".agent_context", "skills")); !os.IsNotExist(err) {
+		t.Error(".agent_context/skills/ MUST NOT be written for openclaw — the scanner does not read that path")
+	}
 	if _, err := os.Stat(filepath.Join(dir, ".openclaw", "skills")); !os.IsNotExist(err) {
 		t.Error(".openclaw/skills/ MUST NOT be written — openclaw never scans that path; writing there is a dead drop")
 	}
