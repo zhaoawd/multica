@@ -345,10 +345,7 @@ export default function ChatTab() {
         : undefined;
 
   return (
-    <SafeAreaView
-      className="flex-1 bg-background"
-      edges={["top", "bottom"]}
-    >
+    <SafeAreaView className="flex-1 bg-background" edges={["top"]}>
       <ChatHeader
         currentSession={activeSession}
         currentAgent={currentAgent}
