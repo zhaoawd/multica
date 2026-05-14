@@ -37,6 +37,7 @@ type SquadMemberResponse struct {
 	MemberID   string `json:"member_id"`
 	Role       string `json:"role"`
 	CreatedAt  string `json:"created_at"`
+	IsArchived bool   `json:"is_archived"`
 }
 
 // ── Converters ──────────────────────────────────────────────────────────────
@@ -149,12 +150,16 @@ func (h *Handler) CreateSquad(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate leader is an agent in this workspace.
-	_, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
+	leader, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
 		ID:          leaderUUID,
 		WorkspaceID: wsUUID,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "leader must be a valid agent in this workspace")
+		return
+	}
+	if leader.ArchivedAt.Valid {
+		writeError(w, http.StatusBadRequest, "cannot use an archived agent as squad leader")
 		return
 	}
 
@@ -237,10 +242,15 @@ func (h *Handler) UpdateSquad(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Validate new leader is an agent in workspace.
-		if _, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
+		newLeader, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
 			ID: lid, WorkspaceID: wsUUID,
-		}); err != nil {
+		})
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "leader must be a valid agent in this workspace")
+			return
+		}
+		if newLeader.ArchivedAt.Valid {
+			writeError(w, http.StatusBadRequest, "cannot use an archived agent as squad leader")
 			return
 		}
 		// Ensure new leader is a squad member; auto-add if not.
@@ -323,6 +333,11 @@ func (h *Handler) ListSquadMembers(w http.ResponseWriter, r *http.Request) {
 	resp := make([]SquadMemberResponse, len(members))
 	for i, m := range members {
 		resp[i] = squadMemberToResponse(m)
+		if m.MemberType == "agent" {
+			if ag, err := h.Queries.GetAgent(r.Context(), m.MemberID); err == nil {
+				resp[i].IsArchived = ag.ArchivedAt.Valid
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -367,10 +382,15 @@ func (h *Handler) AddSquadMember(w http.ResponseWriter, r *http.Request) {
 
 	// Validate the member belongs to this workspace.
 	if req.MemberType == "agent" {
-		if _, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
+		agent, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
 			ID: memberUUID, WorkspaceID: wsUUID,
-		}); err != nil {
+		})
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "agent not found in this workspace")
+			return
+		}
+		if agent.ArchivedAt.Valid {
+			writeError(w, http.StatusBadRequest, "cannot add an archived agent to a squad")
 			return
 		}
 	} else {
