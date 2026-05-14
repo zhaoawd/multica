@@ -1,20 +1,16 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState } from "react";
 import {
   ArrowLeft,
-  ChevronDown,
-  Cloud,
   FileText,
   Globe,
-  Loader2,
   Lock,
   PenLine,
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ProviderLogo } from "../../runtimes/components/provider-logo";
-import { ActorAvatar } from "../../common/actor-avatar";
 import { ModelDropdown } from "./model-dropdown";
+import { RuntimePicker, isRuntimeUsableForUser } from "./runtime-picker";
 import { TemplatePicker } from "./template-picker";
 import { TemplateDetail } from "./template-detail";
 import { InstructionsEditor } from "./instructions-editor";
@@ -41,11 +37,6 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@multica/ui/components/ui/dialog";
-import {
-  Popover,
-  PopoverTrigger,
-  PopoverContent,
-} from "@multica/ui/components/ui/popover";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
@@ -58,8 +49,6 @@ import {
 } from "@multica/core/agents";
 import { CharCounter } from "./char-counter";
 import { useT } from "../../i18n";
-
-type RuntimeFilter = "mine" | "all";
 
 // State machine encoded as a discriminated union.
 //
@@ -182,77 +171,21 @@ export function CreateAgentDialog({
   );
   const [creating, setCreating] = useState(false);
   const [failedURLs, setFailedURLs] = useState<string[] | null>(null);
-  const [runtimeOpen, setRuntimeOpen] = useState(false);
-  const [runtimeFilter, setRuntimeFilter] = useState<RuntimeFilter>("mine");
 
-  const getOwnerMember = (ownerId: string | null) => {
-    if (!ownerId) return null;
-    return members.find((m) => m.user_id === ownerId) ?? null;
-  };
-
-  const hasOtherRuntimes = runtimes.some((r) => r.owner_id !== currentUserId);
-
-  // A runtime is disabled for the caller when it's owned by someone else
-  // AND its visibility is not "public". Older backends that haven't shipped
-  // MUL-2062 leave visibility undefined; we treat anything other than the
-  // literal string "public" as private so the strict default holds (the
-  // backend will reject the create anyway).
-  const isRuntimeDisabledForUser = (r: RuntimeDevice): boolean => {
-    if (!currentUserId) return false;
-    if (r.owner_id === currentUserId) return false;
-    return r.visibility !== "public";
-  };
-
-  const filteredRuntimes = useMemo(() => {
-    const filtered = runtimeFilter === "mine" && currentUserId
-      ? runtimes.filter((r) => r.owner_id === currentUserId)
-      : runtimes;
-    return [...filtered].sort((a, b) => {
-      // Caller's own runtimes first; among the rest, usable (public) ones
-      // come before unusable (private) ones so the picker doesn't lead
-      // with greyed-out rows.
-      const aMine = a.owner_id === currentUserId;
-      const bMine = b.owner_id === currentUserId;
-      if (aMine && !bMine) return -1;
-      if (!aMine && bMine) return 1;
-      const aDisabled = isRuntimeDisabledForUser(a);
-      const bDisabled = isRuntimeDisabledForUser(b);
-      if (!aDisabled && bDisabled) return -1;
-      if (aDisabled && !bDisabled) return 1;
-      return 0;
-    });
-    // currentUserId is the only external dep of isRuntimeDisabledForUser;
-    // listing it in the deps array is enough.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runtimes, runtimeFilter, currentUserId]);
-
-  // When duplicating, default to the template's runtime so the clone
-  // lands on the same machine — caller can still switch in the picker.
-  // But never seed with a runtime the caller can't actually use (locked
-  // by visibility); otherwise the dialog opens with a selected row the
-  // user can't submit, and Create falls through to a backend 403. Falling
-  // back to the first usable runtime is friendlier than the locked
-  // pre-fill. Computed inside the initializer so the find-walk only runs
-  // on first mount, not on every render.
+  // Duplicate-mode pre-fill: clone lands on the source agent's runtime so
+  // the user doesn't have to re-pick. Skipped when that runtime is now
+  // locked for the caller (Create would 403). Empty fallback hands the
+  // job to RuntimePicker — it owns filter state, so it's the only place
+  // that knows which runtimes are visible right now.
   const [selectedRuntimeId, setSelectedRuntimeId] = useState(() => {
     const templateRuntime = template?.runtime_id
       ? runtimes.find((r) => r.id === template.runtime_id)
       : undefined;
-    if (templateRuntime && !isRuntimeDisabledForUser(templateRuntime)) {
+    if (templateRuntime && isRuntimeUsableForUser(templateRuntime, currentUserId)) {
       return templateRuntime.id;
     }
-    return filteredRuntimes.find((r) => !isRuntimeDisabledForUser(r))?.id ?? "";
+    return "";
   });
-
-  useEffect(() => {
-    if (!selectedRuntimeId) {
-      const firstUsable = filteredRuntimes.find(
-        (r) => !isRuntimeDisabledForUser(r),
-      );
-      if (firstUsable) setSelectedRuntimeId(firstUsable.id);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredRuntimes, selectedRuntimeId]);
 
   const selectedRuntime = runtimes.find((d) => d.id === selectedRuntimeId) ?? null;
   // Defense-in-depth: even if a locked runtime somehow ends up selected
@@ -260,7 +193,8 @@ export function CreateAgentDialog({
   // the workspace has no usable fallback), gate Create on it so we don't
   // submit a request the backend will reject with 403.
   const selectedRuntimeLocked =
-    selectedRuntime != null && isRuntimeDisabledForUser(selectedRuntime);
+    selectedRuntime != null &&
+    !isRuntimeUsableForUser(selectedRuntime, currentUserId);
 
   // Transition helpers. Each centralises the form-field initialisation
   // for its target step, so transitions can't leave stale state behind.
@@ -300,6 +234,7 @@ export function CreateAgentDialog({
         template_slug: tmpl.slug,
         name: candidate,
         runtime_id: selectedRuntime.id,
+        model: model.trim() || undefined,
         visibility: "workspace",
       });
       if (wsId) {
@@ -555,6 +490,16 @@ export function CreateAgentDialog({
             onUse={quickCreateFromTemplate}
             creating={creating}
             failedURLs={failedURLs}
+            runtimes={runtimes}
+            runtimesLoading={runtimesLoading}
+            members={members}
+            currentUserId={currentUserId}
+            selectedRuntimeId={selectedRuntimeId}
+            onRuntimeSelect={setSelectedRuntimeId}
+            selectedRuntime={selectedRuntime}
+            model={model}
+            onModelChange={setModel}
+            useDisabled={!selectedRuntime || selectedRuntimeLocked}
           />
         )}
 
@@ -652,131 +597,14 @@ export function CreateAgentDialog({
                   </div>
                 </div>
 
-                <div className="min-w-0">
-                  <div className="flex items-center justify-between">
-                    <Label className="text-xs text-muted-foreground">{t(($) => $.create_dialog.runtime_label)}</Label>
-                    {hasOtherRuntimes && (
-                      <div className="flex items-center gap-0.5 rounded-md bg-muted p-0.5">
-                        <button
-                          type="button"
-                          onClick={() => { setRuntimeFilter("mine"); setSelectedRuntimeId(""); }}
-                          className={`rounded px-2 py-0.5 text-xs font-medium transition-colors ${
-                            runtimeFilter === "mine"
-                              ? "bg-background text-foreground shadow-sm"
-                              : "text-muted-foreground hover:text-foreground"
-                          }`}
-                        >
-                          {t(($) => $.create_dialog.runtime_filter_mine)}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => { setRuntimeFilter("all"); setSelectedRuntimeId(""); }}
-                          className={`rounded px-2 py-0.5 text-xs font-medium transition-colors ${
-                            runtimeFilter === "all"
-                              ? "bg-background text-foreground shadow-sm"
-                              : "text-muted-foreground hover:text-foreground"
-                          }`}
-                        >
-                          {t(($) => $.create_dialog.runtime_filter_all)}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  <Popover open={runtimeOpen} onOpenChange={setRuntimeOpen}>
-                    <PopoverTrigger
-                      disabled={runtimes.length === 0 && !runtimesLoading}
-                      className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 mt-1.5 text-left text-sm transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
-                    >
-                      {runtimesLoading ? (
-                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
-                      ) : selectedRuntime ? (
-                        <ProviderLogo provider={selectedRuntime.provider} className="h-4 w-4 shrink-0" />
-                      ) : (
-                        <Cloud className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      )}
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate font-medium">
-                            {runtimesLoading ? t(($) => $.create_dialog.runtime_loading) : (selectedRuntime?.name ?? t(($) => $.create_dialog.runtime_none))}
-                          </span>
-                          {selectedRuntime?.runtime_mode === "cloud" && (
-                            <span className="shrink-0 rounded bg-info/10 px-1.5 py-0.5 text-xs font-medium text-info">
-                              {t(($) => $.create_dialog.runtime_cloud_badge)}
-                            </span>
-                          )}
-                        </div>
-                        <div className="truncate text-xs text-muted-foreground">
-                          {selectedRuntime
-                            ? (getOwnerMember(selectedRuntime.owner_id)?.name ?? selectedRuntime.device_info)
-                            : t(($) => $.create_dialog.runtime_register_first)}
-                        </div>
-                      </div>
-                      <ChevronDown className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${runtimeOpen ? "rotate-180" : ""}`} />
-                    </PopoverTrigger>
-                    <PopoverContent align="start" className="w-[var(--anchor-width)] p-1 max-h-60 overflow-y-auto">
-                      {filteredRuntimes.map((device) => {
-                        const ownerMember = getOwnerMember(device.owner_id);
-                        const disabled = isRuntimeDisabledForUser(device);
-                        const disabledTitle = disabled
-                          ? t(($) => $.create_dialog.runtime_private_locked_tooltip)
-                          : undefined;
-                        return (
-                          <button
-                            key={device.id}
-                            type="button"
-                            disabled={disabled}
-                            title={disabledTitle}
-                            onClick={() => {
-                              if (disabled) return;
-                              setSelectedRuntimeId(device.id);
-                              setRuntimeOpen(false);
-                            }}
-                            className={`flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm transition-colors ${
-                              disabled
-                                ? "cursor-not-allowed opacity-50"
-                                : device.id === selectedRuntimeId
-                                  ? "bg-accent"
-                                  : "hover:bg-accent/50"
-                            }`}
-                          >
-                            <ProviderLogo provider={device.provider} className="h-4 w-4 shrink-0" />
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
-                                <span className="truncate font-medium">{device.name}</span>
-                                {device.runtime_mode === "cloud" && (
-                                  <span className="shrink-0 rounded bg-info/10 px-1.5 py-0.5 text-xs font-medium text-info">
-                                    {t(($) => $.create_dialog.runtime_cloud_badge)}
-                                  </span>
-                                )}
-                                {disabled && (
-                                  <span className="shrink-0 inline-flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-                                    <Lock className="h-3 w-3" />
-                                    {t(($) => $.create_dialog.runtime_private_badge)}
-                                  </span>
-                                )}
-                              </div>
-                              <div className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
-                                {ownerMember ? (
-                                  <>
-                                    <ActorAvatar actorType="member" actorId={ownerMember.user_id} size={14} />
-                                    <span className="truncate">{ownerMember.name}</span>
-                                  </>
-                                ) : (
-                                  <span className="truncate">{device.device_info}</span>
-                                )}
-                              </div>
-                            </div>
-                            <span
-                              className={`h-2 w-2 shrink-0 rounded-full ${
-                                device.status === "online" ? "bg-success" : "bg-muted-foreground/40"
-                              }`}
-                            />
-                          </button>
-                        );
-                      })}
-                    </PopoverContent>
-                  </Popover>
-                </div>
+                <RuntimePicker
+                  runtimes={runtimes}
+                  runtimesLoading={runtimesLoading}
+                  members={members}
+                  currentUserId={currentUserId}
+                  selectedRuntimeId={selectedRuntimeId}
+                  onSelect={setSelectedRuntimeId}
+                />
 
                 <ModelDropdown
                   runtimeId={selectedRuntime?.id ?? null}
