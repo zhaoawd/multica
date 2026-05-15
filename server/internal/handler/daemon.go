@@ -1509,13 +1509,20 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 
 	var claimToken pgtype.UUID
 	if body.ClaimToken != "" {
-		if parsed, err := util.ParseUUID(body.ClaimToken); err == nil {
-			claimToken = parsed
+		parsed, err := util.ParseUUID(body.ClaimToken)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "malformed claim_token")
+			return
 		}
+		claimToken = parsed
 	}
 
 	task, err := h.TaskService.StartTask(r.Context(), parseUUID(taskID), claimToken)
 	if err != nil {
+		if errors.Is(err, service.ErrClaimTokenInvalid) {
+			writeError(w, http.StatusConflict, "claim token expired or superseded")
+			return
+		}
 		slog.Warn("start task failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

@@ -56,6 +56,11 @@ const triggerSummaryMaxLen = 200
 // this window; otherwise the expired-lease sweeper requeues the task.
 const claimLeaseSeconds = 60.0
 
+// ErrClaimTokenInvalid is returned when StartTask is called with a claim_token
+// that does not match or whose lease has expired (task may have been requeued
+// and re-claimed by another runtime).
+var ErrClaimTokenInvalid = errors.New("claim token expired or superseded")
+
 // requeueMaxPerTick caps how many expired-lease rows a single sweeper tick
 // requeues back to 'queued'. Keeps the sweep transaction short.
 const RequeueMaxPerTick = 50
@@ -741,7 +746,7 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 
 // ClaimTask atomically claims the next queued task for an agent,
 // respecting max_concurrent_tasks.
-func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.AgentTaskQueue, error) {
+func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
 	start := time.Now()
 	var (
 		outcome                                                              = "unknown"
@@ -773,8 +778,9 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 	}
 
 	t0 = time.Now()
-	task, err := s.Queries.ClaimAgentTaskWithLease(ctx, db.ClaimAgentTaskWithLeaseParams{
+	task, err := s.Queries.ClaimAgentTaskForRuntime(ctx, db.ClaimAgentTaskForRuntimeParams{
 		AgentID:      agentID,
+		RuntimeID:    runtimeID,
 		LeaseSeconds: claimLeaseSeconds,
 	})
 	claimAgentMs = time.Since(t0).Milliseconds()
@@ -881,13 +887,13 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		triedAgents[agentKey] = struct{}{}
 		tried++
 
-		task, err := s.ClaimTask(ctx, candidate.AgentID)
+		task, err := s.ClaimTask(ctx, candidate.AgentID, runtimeID)
 		if err != nil {
 			loopMs = time.Since(loopStart).Milliseconds()
 			outcome = "error_claim"
 			return nil, err
 		}
-		if task != nil && task.RuntimeID == runtimeID {
+		if task != nil {
 			claimed = task
 			break
 		}
@@ -926,25 +932,65 @@ func (s *TaskService) maybeLogClaimSlow(agentID pgtype.UUID, outcome string, sta
 // StartTask transitions a dispatched task to running.
 // Issue status is NOT changed here — the agent manages it via the CLI.
 // When claimToken is valid, uses the token-verified path; otherwise falls
-// back to the legacy tokenless start for old daemons.
+// back to the legacy tokenless start for old daemons (only works on rows
+// without a claim_token).
 func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, claimToken pgtype.UUID) (*db.AgentTaskQueue, error) {
 	var task db.AgentTaskQueue
 	var err error
 	if claimToken.Valid {
-		task, err = s.Queries.StartAgentTaskWithClaimToken(ctx, db.StartAgentTaskWithClaimTokenParams{
+		row, rowErr := s.Queries.StartAgentTaskWithClaimToken(ctx, db.StartAgentTaskWithClaimTokenParams{
 			ID:         taskID,
 			ClaimToken: claimToken,
 		})
+		if rowErr != nil {
+			if errors.Is(rowErr, pgx.ErrNoRows) {
+				return nil, ErrClaimTokenInvalid
+			}
+			return nil, fmt.Errorf("start task: %w", rowErr)
+		}
+		task = startAgentTaskRowToQueue(row)
 	} else {
 		task, err = s.Queries.StartAgentTask(ctx, taskID)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("start task: %w", err)
+		if err != nil {
+			return nil, fmt.Errorf("start task: %w", err)
+		}
 	}
 
 	slog.Info("task started", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 	s.captureTaskStarted(ctx, task)
 	return &task, nil
+}
+
+func startAgentTaskRowToQueue(r db.StartAgentTaskWithClaimTokenRow) db.AgentTaskQueue {
+	return db.AgentTaskQueue{
+		ID:                r.ID,
+		AgentID:           r.AgentID,
+		IssueID:           r.IssueID,
+		Status:            r.Status,
+		Priority:          r.Priority,
+		DispatchedAt:      r.DispatchedAt,
+		StartedAt:         r.StartedAt,
+		CompletedAt:       r.CompletedAt,
+		Result:            r.Result,
+		Error:             r.Error,
+		CreatedAt:         r.CreatedAt,
+		Context:           r.Context,
+		RuntimeID:         r.RuntimeID,
+		SessionID:         r.SessionID,
+		WorkDir:           r.WorkDir,
+		TriggerCommentID:  r.TriggerCommentID,
+		ChatSessionID:     r.ChatSessionID,
+		AutopilotRunID:    r.AutopilotRunID,
+		Attempt:           r.Attempt,
+		MaxAttempts:       r.MaxAttempts,
+		ParentTaskID:      r.ParentTaskID,
+		FailureReason:     r.FailureReason,
+		TriggerSummary:    r.TriggerSummary,
+		ForceFreshSession: r.ForceFreshSession,
+		IsLeaderTask:      r.IsLeaderTask,
+		ClaimToken:        r.ClaimToken,
+		ClaimExpiresAt:    r.ClaimExpiresAt,
+	}
 }
 
 // RequeueExpiredClaimLeases moves dispatched tasks whose claim lease has

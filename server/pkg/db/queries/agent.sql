@@ -227,7 +227,7 @@ RETURNING *;
 -- name: StartAgentTask :one
 UPDATE agent_task_queue
 SET status = 'running', started_at = now()
-WHERE id = $1 AND status = 'dispatched'
+WHERE id = $1 AND status = 'dispatched' AND claim_token IS NULL
 RETURNING *;
 
 -- name: CompleteAgentTask :one
@@ -540,12 +540,11 @@ SET status = CASE WHEN EXISTS (
 WHERE a.id = $1
 RETURNING *;
 
--- name: ClaimAgentTaskWithLease :one
--- Like ClaimAgentTask but generates a claim_token and sets claim_expires_at.
--- The daemon must present the token back in StartAgentTaskWithClaimToken to
--- prove it received the claim response. If claim_expires_at passes without
--- a successful StartTask, the expired-lease requeue sweep moves the task
--- back to 'queued'.
+-- name: ClaimAgentTaskForRuntime :one
+-- Like ClaimAgentTask but constrains by both agent_id AND runtime_id, generates
+-- a claim_token and sets claim_expires_at. This prevents runtime A from claiming
+-- a task queued for runtime B under the same agent. The daemon must present the
+-- token back in StartAgentTaskWithClaimToken to prove it received the claim response.
 UPDATE agent_task_queue
 SET status = 'dispatched',
     dispatched_at = now(),
@@ -553,7 +552,9 @@ SET status = 'dispatched',
     claim_expires_at = now() + make_interval(secs => @lease_seconds::double precision)
 WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
-    WHERE atq.agent_id = $1 AND atq.status = 'queued'
+    WHERE atq.agent_id = @agent_id
+      AND atq.runtime_id = @runtime_id
+      AND atq.status = 'queued'
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
           WHERE active.agent_id = atq.agent_id
@@ -579,16 +580,28 @@ RETURNING *;
 
 -- name: StartAgentTaskWithClaimToken :one
 -- Transitions a dispatched task to running only if the caller presents the
--- correct claim_token. This prevents a stale daemon (whose original claim
--- response was lost) from starting a task that has since been requeued and
--- re-claimed by another runtime.
-UPDATE agent_task_queue
-SET status = 'running',
-    started_at = now(),
-    claim_token = NULL,
-    claim_expires_at = NULL
-WHERE id = $1 AND status = 'dispatched' AND claim_token = $2
-RETURNING *;
+-- correct claim_token AND the lease has not expired. Token is preserved until
+-- terminal state so that a daemon retrying after a lost StartTask response
+-- can succeed idempotently (the UNION ALL returns the already-running row).
+WITH started AS (
+    UPDATE agent_task_queue
+    SET status = 'running',
+        started_at = COALESCE(started_at, now()),
+        claim_expires_at = NULL
+    WHERE agent_task_queue.id = @id
+      AND agent_task_queue.status = 'dispatched'
+      AND agent_task_queue.claim_token = @claim_token
+      AND agent_task_queue.claim_expires_at >= now()
+    RETURNING *
+)
+SELECT * FROM started
+UNION ALL
+SELECT atq.* FROM agent_task_queue atq
+WHERE atq.id = @id
+  AND atq.status = 'running'
+  AND atq.claim_token = @claim_token
+  AND NOT EXISTS (SELECT 1 FROM started)
+LIMIT 1;
 
 -- name: RequeueExpiredClaimLeases :many
 -- Moves dispatched tasks whose claim lease has expired back to 'queued' so
