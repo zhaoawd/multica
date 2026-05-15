@@ -585,44 +585,6 @@ func TestInjectRuntimeConfigClaude(t *testing.T) {
 	}
 }
 
-// Regression test for GitHub #2588: Claude's CLAUDE.md must tell the agent
-// NOT to call the built-in AskUserQuestion tool, and to use an issue
-// comment + blocked status for clarification instead. Non-Claude providers
-// don't expose the tool, so the section must not appear for them.
-func TestInjectRuntimeConfigClaudeForbidsAskUserQuestion(t *testing.T) {
-	t.Parallel()
-
-	claudeDir := t.TempDir()
-	if _, err := InjectRuntimeConfig(claudeDir, "claude", TaskContextForEnv{IssueID: "issue-1"}); err != nil {
-		t.Fatalf("InjectRuntimeConfig claude: %v", err)
-	}
-	claudeMD, err := os.ReadFile(filepath.Join(claudeDir, "CLAUDE.md"))
-	if err != nil {
-		t.Fatalf("read CLAUDE.md: %v", err)
-	}
-	for _, want := range []string{
-		"AskUserQuestion",
-		"blocked",
-		"issue comment",
-	} {
-		if !strings.Contains(string(claudeMD), want) {
-			t.Errorf("CLAUDE.md missing %q", want)
-		}
-	}
-
-	codexDir := t.TempDir()
-	if _, err := InjectRuntimeConfig(codexDir, "codex", TaskContextForEnv{IssueID: "issue-1"}); err != nil {
-		t.Fatalf("InjectRuntimeConfig codex: %v", err)
-	}
-	codexMD, err := os.ReadFile(filepath.Join(codexDir, "AGENTS.md"))
-	if err != nil {
-		t.Fatalf("read AGENTS.md: %v", err)
-	}
-	if strings.Contains(string(codexMD), "AskUserQuestion") {
-		t.Errorf("non-Claude AGENTS.md should not mention AskUserQuestion")
-	}
-}
-
 // Regression test for #2347: the runtime config injected into agent harnesses
 // must advertise both autopilot execution modes on create AND update, so an
 // agent acting as a CLI user is not confined to create_issue.

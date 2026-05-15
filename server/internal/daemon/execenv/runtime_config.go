@@ -169,11 +169,6 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 	b.WriteString("- `multica autopilot trigger <id>` — Manually trigger an autopilot to run once\n")
 	b.WriteString("- `multica autopilot delete <id>` — Delete an autopilot\n\n")
 
-	if provider == "claude" {
-		b.WriteString("## Asking the User a Question\n\n")
-		b.WriteString("Do not call Claude Code's built-in `AskUserQuestion` tool. The daemon runs Claude in non-interactive stream-json mode, so the question never renders to the user and you receive an empty answer (see GitHub #2588). If you genuinely need clarification, post a question as an issue comment and set the issue status to `blocked`; the user will reply on the issue and reassign. If clarification is not worth blocking on, state the assumption you're making and proceed.\n\n")
-	}
-
 	if provider == "codex" {
 		b.WriteString("## Codex-Specific Comment Formatting\n\n")
 		if runtimeGOOS == "windows" {
