@@ -1,7 +1,6 @@
 /**
- * GlobalNavMenu — top-right `…` popover that lets the user jump to any
- * top-level destination (Inbox, My Issues, Favorites, Projects, Initiatives,
- * Views, Teams, Settings, Search) and switch workspace.
+ * GlobalNavMenu — bottom-right popover anchored above the More tab. Three
+ * sections: user identity card → workspace switcher → real feature entries.
  *
  * Why a popover and not a tab: the iOS HIG treats tab-bar items as
  * destinations, not action triggers, so "More" was an anti-pattern. Linear /
@@ -11,16 +10,30 @@
  * Reanimated v3 and the mobile app is on Reanimated v4. Same Modal+Pressable
  * pattern as status-picker-sheet.tsx etc. — keeps the dependency surface
  * untouched.
+ *
+ * Composition mirrors web's sidebar dropdown (packages/views/layout/
+ * app-sidebar.tsx:496-511): user info row (avatar + name + email) sits above
+ * the workspace list. On mobile the row is a tappable card that pushes into
+ * the existing settings page, since there isn't enough screen real estate to
+ * inline account / workspaces / sign-out the way web does.
  */
 import { useMemo, useState } from "react";
-import { ActivityIndicator, Modal, Pressable, ScrollView, View } from "react-native";
+import {
+  ActivityIndicator,
+  Image,
+  Modal,
+  Pressable,
+  ScrollView,
+  View,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { router, usePathname } from "expo-router";
 import { useQuery } from "@tanstack/react-query";
-import type { Workspace } from "@multica/core/types";
+import type { User, Workspace } from "@multica/core/types";
 import { Text } from "@/components/ui/text";
 import { workspaceListOptions } from "@/data/queries/workspaces";
+import { useAuthStore } from "@/data/auth-store";
 import { useWorkspaceStore } from "@/data/workspace-store";
 import { cn } from "@/lib/utils";
 
@@ -31,16 +44,11 @@ interface NavItem {
   path: string;
 }
 
+// Inbox / My Issues / Chat live on the bottom tab bar; Settings is reached
+// via the user card at the top of this popover. Only entries that are NOT
+// covered by either of those surfaces belong here.
 const NAV_ITEMS: NavItem[] = [
-  { label: "Inbox", icon: "mail-outline", path: "/inbox" },
-  { label: "My Issues", icon: "list-outline", path: "/my-issues" },
-  { label: "Favorites", icon: "star-outline", path: "/more/favorites" },
   { label: "Projects", icon: "cube-outline", path: "/more/projects" },
-  { label: "Initiatives", icon: "navigate-outline", path: "/more/initiatives" },
-  { label: "Views", icon: "layers-outline", path: "/more/views" },
-  { label: "Teams", icon: "people-outline", path: "/more/teams" },
-  { label: "Settings", icon: "settings-outline", path: "/more/settings" },
-  { label: "Search", icon: "search-outline", path: "/search" },
 ];
 
 const ICON_COLOR = "#3f3f46";
@@ -54,6 +62,7 @@ interface Props {
 export function GlobalNavMenu({ visible, onClose }: Props) {
   const insets = useSafeAreaInsets();
   const slug = useWorkspaceStore((s) => s.currentWorkspaceSlug);
+  const user = useAuthStore((s) => s.user);
   const pathname = usePathname();
   const [showWorkspaces, setShowWorkspaces] = useState(false);
 
@@ -75,6 +84,13 @@ export function GlobalNavMenu({ visible, onClose }: Props) {
     router.push(`/${slug}${path}`);
   };
 
+  const onOpenSettings = () => {
+    if (!slug) return;
+    onClose();
+    setShowWorkspaces(false);
+    router.push(`/${slug}/more/settings`);
+  };
+
   return (
     <Modal
       visible={visible}
@@ -90,10 +106,11 @@ export function GlobalNavMenu({ visible, onClose }: Props) {
         }}
       >
         <View
-          // Anchor under the top-right header. 8pt below safe-area top to
-          // leave a hair of breathing room from the `…` trigger.
-          style={{ paddingTop: insets.top + 56, paddingRight: 12 }}
-          className="flex-1 items-end"
+          // Anchor above the bottom tab bar (49pt iOS default + bottom
+          // safe-area inset for the home indicator) with a hair of
+          // breathing room. Menu rises from the More tab on the right.
+          style={{ paddingBottom: insets.bottom + 49 + 8, paddingRight: 12 }}
+          className="flex-1 items-end justify-end"
         >
           <Pressable onPress={() => {}}>
             <View
@@ -107,6 +124,10 @@ export function GlobalNavMenu({ visible, onClose }: Props) {
                 elevation: 8,
               }}
             >
+              {/* User identity card — tap pushes into settings, where
+                  account info, workspace list, and sign out already live. */}
+              <UserCard user={user} onPress={onOpenSettings} />
+
               {/* Workspace switcher header */}
               <Pressable
                 onPress={() => setShowWorkspaces((v) => !v)}
@@ -238,5 +259,48 @@ function useCurrentWorkspace(slug: string | null): Workspace | undefined {
   return useMemo(
     () => (slug ? data?.find((w) => w.slug === slug) : undefined),
     [data, slug],
+  );
+}
+
+function UserCard({
+  user,
+  onPress,
+}: {
+  user: User | null;
+  onPress: () => void;
+}) {
+  const initial = (user?.name ?? user?.email ?? "U").charAt(0).toUpperCase();
+  return (
+    <Pressable
+      onPress={onPress}
+      className="flex-row items-center gap-3 px-4 py-3.5 active:bg-secondary border-b border-border"
+    >
+      {user?.avatar_url ? (
+        <Image
+          source={{ uri: user.avatar_url }}
+          className="size-10 rounded-full bg-muted"
+        />
+      ) : (
+        <View className="size-10 rounded-full bg-muted items-center justify-center">
+          <Text className="text-sm font-medium text-muted-foreground">
+            {initial}
+          </Text>
+        </View>
+      )}
+      <View className="flex-1 min-w-0">
+        <Text
+          className="text-sm font-medium text-foreground"
+          numberOfLines={1}
+        >
+          {user?.name ?? "—"}
+        </Text>
+        {user?.email ? (
+          <Text className="text-xs text-muted-foreground mt-0.5" numberOfLines={1}>
+            {user.email}
+          </Text>
+        ) : null}
+      </View>
+      <Ionicons name="chevron-forward" size={16} color={ICON_MUTED} />
+    </Pressable>
   );
 }
