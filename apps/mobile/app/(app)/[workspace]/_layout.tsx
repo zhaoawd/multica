@@ -5,6 +5,7 @@ import { workspaceListOptions } from "@/data/queries/workspaces";
 import { useWorkspaceStore } from "@/data/workspace-store";
 import { RealtimeProvider } from "@/data/realtime/realtime-provider";
 import { useInboxRealtime } from "@/data/realtime/use-inbox-realtime";
+import { useIssuesRealtime } from "@/data/realtime/use-issues-realtime";
 import { useMyIssuesRealtime } from "@/data/realtime/use-my-issues-realtime";
 import { useChatSessionsRealtime } from "@/data/realtime/use-chat-sessions-realtime";
 import { useProjectsRealtime } from "@/data/realtime/use-projects-realtime";
@@ -21,6 +22,7 @@ import { ModalCloseButton } from "@/components/ui/modal-close-button";
  */
 function RealtimeSubscriptions() {
   useInboxRealtime();
+  useIssuesRealtime();
   useMyIssuesRealtime();
   useChatSessionsRealtime();
   useProjectsRealtime();
@@ -95,6 +97,10 @@ export default function WorkspaceLayout() {
           }}
         />
         <Stack.Screen
+          name="more/issues"
+          options={{ title: "Issues", headerBackTitle: "Back" }}
+        />
+        <Stack.Screen
           name="more/projects"
           options={{ title: "Projects", headerBackTitle: "Back" }}
         />
@@ -103,32 +109,8 @@ export default function WorkspaceLayout() {
           options={{ title: "Agents", headerBackTitle: "Back" }}
         />
         <Stack.Screen
-          name="more/pins"
-          options={{ title: "Pins", headerBackTitle: "Back" }}
-        />
-        <Stack.Screen
-          name="more/notifications"
-          options={{ title: "Notifications", headerBackTitle: "Back" }}
-        />
-        <Stack.Screen
           name="more/settings"
           options={{ title: "Settings", headerBackTitle: "Back" }}
-        />
-        <Stack.Screen
-          name="more/favorites"
-          options={{ title: "Favorites", headerBackTitle: "Back" }}
-        />
-        <Stack.Screen
-          name="more/initiatives"
-          options={{ title: "Initiatives", headerBackTitle: "Back" }}
-        />
-        <Stack.Screen
-          name="more/views"
-          options={{ title: "Views", headerBackTitle: "Back" }}
-        />
-        <Stack.Screen
-          name="more/teams"
-          options={{ title: "Teams", headerBackTitle: "Back" }}
         />
         <Stack.Screen
           name="new-issue"

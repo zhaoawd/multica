@@ -21,6 +21,9 @@
  *   - My Issues list:  Issue[]                                (keyed by myList(wsId, scope, filter))
  *                      Multiple list caches per wsId (one per scope/filter combo).
  *                      Patch ALL of them via setQueriesData on myAll(wsId).
+ *   - Workspace list:  Issue[]                                (keyed by list(wsId))
+ *                      Single cache per wsId (no scope/filter in the key —
+ *                      filtering happens client-side off the same list).
  */
 import type { QueryClient } from "@tanstack/react-query";
 import type {
@@ -161,6 +164,42 @@ export function removeFromMyIssuesList(
 }
 
 // =====================================================
+// Workspace Issues list (flat Issue[] under list(wsId))
+// =====================================================
+
+export function patchIssuesList(
+  qc: QueryClient,
+  wsId: string,
+  partial: Partial<Issue> & { id: string },
+) {
+  qc.setQueryData<Issue[]>(issueKeys.list(wsId), (old) =>
+    old ? old.map((i) => (i.id === partial.id ? { ...i, ...partial } : i)) : old,
+  );
+}
+
+export function prependToIssuesList(
+  qc: QueryClient,
+  wsId: string,
+  issue: Issue,
+) {
+  qc.setQueryData<Issue[]>(issueKeys.list(wsId), (old) => {
+    if (!old) return old;
+    if (old.some((i) => i.id === issue.id)) return old;
+    return [issue, ...old];
+  });
+}
+
+export function removeFromIssuesList(
+  qc: QueryClient,
+  wsId: string,
+  issueId: string,
+) {
+  qc.setQueryData<Issue[]>(issueKeys.list(wsId), (old) =>
+    old ? old.filter((i) => i.id !== issueId) : old,
+  );
+}
+
+// =====================================================
 // Reactions
 // =====================================================
 
@@ -255,6 +294,11 @@ export function patchIssueLabels(
     old ? { ...old, labels } : old,
   );
   qc.setQueriesData<Issue[]>({ queryKey: issueKeys.myAll(wsId) }, (old) =>
+    old
+      ? old.map((i) => (i.id === issueId ? { ...i, labels } : i))
+      : old,
+  );
+  qc.setQueryData<Issue[]>(issueKeys.list(wsId), (old) =>
     old
       ? old.map((i) => (i.id === issueId ? { ...i, labels } : i))
       : old,
