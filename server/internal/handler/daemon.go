@@ -328,7 +328,9 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 	// PAT/JWT tokens require a membership check and set OwnerID from the member.
 	var ownerID pgtype.UUID
 	installSource := "" // empty => UpsertAgentRuntime keeps the prior metadata
+	daemonTokenAuth := false
 	if daemonWsID := middleware.DaemonWorkspaceIDFromContext(r.Context()); daemonWsID != "" {
+		daemonTokenAuth = true
 		if daemonWsID != req.WorkspaceID {
 			writeError(w, http.StatusNotFound, "workspace not found")
 			return
@@ -490,12 +492,15 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Seamless migration from the previous hostname-derived identity. The
-		// daemon sends every legacy daemon_id it may have registered under
-		// (e.g. "host.local", "host", "host-staging"); for each match we
-		// reassign agents + tasks onto the new UUID-keyed row, then delete
-		// the stale row so there's only ever one runtime per machine.
-		h.mergeLegacyRuntimes(r, registered, provider, req.LegacyDaemonIDs)
+		if !daemonTokenAuth {
+			// Seamless migration from the previous hostname-derived identity.
+			// PAT/JWT registration is the compatibility path for older daemons
+			// that can legitimately claim hostname-derived legacy ids. mdt_
+			// credentials are already bound to one daemon_id, so accepting
+			// arbitrary legacy_daemon_ids there would let one daemon take over
+			// another daemon's runtime in the same workspace.
+			h.mergeLegacyRuntimes(r, registered, provider, req.LegacyDaemonIDs)
+		}
 
 		resp = append(resp, runtimeToResponse(registered))
 	}

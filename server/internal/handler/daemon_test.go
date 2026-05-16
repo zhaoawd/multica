@@ -187,6 +187,89 @@ func TestDaemonRegister_WithDaemonToken_DaemonIDMismatch(t *testing.T) {
 	}
 }
 
+func TestDaemonRegister_WithDaemonToken_IgnoresLegacyDaemonIDs(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	legacyDaemonID := "legacy-mdt-" + uuid.NewString()
+	tokenDaemonID := uuid.NewString()
+
+	var legacyRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, $2, 'legacy-mdt-runtime', 'local', 'claude', 'offline', '', '{}'::jsonb, $3, now())
+		RETURNING id
+	`, testWorkspaceID, legacyDaemonID, testUserID).Scan(&legacyRuntimeID); err != nil {
+		t.Fatalf("seed legacy runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, legacyRuntimeID)
+	})
+
+	var legacyAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (workspace_id, name, runtime_mode, runtime_config, runtime_id, visibility, max_concurrent_tasks)
+		VALUES ($1, $2, 'local', '{}'::jsonb, $3, 'workspace', 1)
+		RETURNING id
+	`, testWorkspaceID, "legacy-mdt-agent-"+uuid.NewString(), legacyRuntimeID).Scan(&legacyAgentID); err != nil {
+		t.Fatalf("seed legacy agent: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, legacyAgentID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/register", map[string]any{
+		"workspace_id":      testWorkspaceID,
+		"daemon_id":         tokenDaemonID,
+		"legacy_daemon_ids": []string{legacyDaemonID},
+		"device_name":       "test-device",
+		"runtimes": []map[string]any{
+			{"name": "test-runtime", "type": "claude", "version": "1.0.0", "status": "online"},
+		},
+	}, testWorkspaceID, tokenDaemonID)
+
+	testHandler.DaemonRegister(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonRegister with daemon token: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	newRuntimeID := resp["runtimes"].([]any)[0].(map[string]any)["id"].(string)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, newRuntimeID)
+	})
+
+	var legacyCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_runtime WHERE id = $1`, legacyRuntimeID).Scan(&legacyCount); err != nil {
+		t.Fatalf("count legacy runtime: %v", err)
+	}
+	if legacyCount != 1 {
+		t.Fatalf("expected mdt_ register to leave legacy runtime intact, got count=%d", legacyCount)
+	}
+
+	var agentRuntimeID string
+	if err := testPool.QueryRow(ctx, `SELECT runtime_id FROM agent WHERE id = $1`, legacyAgentID).Scan(&agentRuntimeID); err != nil {
+		t.Fatalf("read legacy agent runtime_id: %v", err)
+	}
+	if agentRuntimeID != legacyRuntimeID {
+		t.Fatalf("expected legacy agent to stay on legacy runtime, got runtime_id=%s want %s", agentRuntimeID, legacyRuntimeID)
+	}
+
+	var legacyTrace *string
+	if err := testPool.QueryRow(ctx, `SELECT legacy_daemon_id FROM agent_runtime WHERE id = $1`, newRuntimeID).Scan(&legacyTrace); err != nil {
+		t.Fatalf("read new runtime legacy_daemon_id: %v", err)
+	}
+	if legacyTrace != nil {
+		t.Fatalf("expected mdt_ register not to record legacy_daemon_id, got %q", *legacyTrace)
+	}
+}
+
 func TestDaemonHeartbeat_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

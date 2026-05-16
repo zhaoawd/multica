@@ -282,21 +282,13 @@ function InstallStep({
       });
   }, []);
 
-  // Always pin the install one-liner to the same server the UI is talking
-  // to. On Multica Cloud that's the production API; on self-hosted /
-  // dev environments it's whatever the user is currently logged in to. The
-  // install script accepts `--server-url` as an optional override, so this
-  // never hurts and removes a whole class of "registered to the wrong
-  // server" footguns.
   const command = useMemo(() => {
     if (!mint || !slug) return "";
-    const base = api.getBaseUrl();
-    return [
-      "curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh",
-      `  | sh -s -- --workspace ${shellQuote(slug)} --token ${mint.token} --server-url ${shellQuote(
-        base,
-      )}`,
-    ].join(" \\\n");
+    return buildInstallCommand({
+      workspaceSlug: slug,
+      token: mint.token,
+      apiBaseUrl: api.getBaseUrl(),
+    });
   }, [mint, slug]);
 
   // Poll computerListOptions while this step is up so a slow / missed WS
@@ -410,6 +402,45 @@ function InstallStep({
       </div>
     </>
   );
+}
+
+export function buildInstallCommand({
+  workspaceSlug,
+  token,
+  apiBaseUrl,
+  browserOrigin,
+}: {
+  workspaceSlug: string;
+  token: string;
+  apiBaseUrl: string;
+  browserOrigin?: string;
+}): string {
+  const serverUrl = resolveInstallServerUrl(apiBaseUrl, browserOrigin);
+  if (!serverUrl) return "";
+  return [
+    "curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh",
+    `  | bash -s -- --workspace ${shellQuote(workspaceSlug)} --token ${shellQuote(
+      token,
+    )} --server-url ${shellQuote(serverUrl)}`,
+  ].join(" \\\n");
+}
+
+function resolveInstallServerUrl(apiBaseUrl: string, browserOrigin?: string): string {
+  const trimmed = apiBaseUrl.trim();
+  if (/^(https?|wss?):\/\//i.test(trimmed)) {
+    return stripTrailingSlashes(trimmed);
+  }
+
+  const origin =
+    browserOrigin ??
+    (typeof window !== "undefined" ? window.location.origin : "");
+  if (!origin) return stripTrailingSlashes(trimmed);
+  if (!trimmed) return stripTrailingSlashes(origin);
+  return stripTrailingSlashes(new URL(trimmed, origin).toString());
+}
+
+function stripTrailingSlashes(s: string): string {
+  return s.replace(/\/+$/, "");
 }
 
 // shellQuote escapes a value so it can be safely interpolated into a shell

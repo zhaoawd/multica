@@ -6,7 +6,7 @@
 #
 # Install CLI + register this machine as a Computer in one shot (RFC v6.1 §6.4):
 #   curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh \
-#       | sh -s -- --workspace <slug> --token <mit_…>
+#       | bash -s -- --workspace <slug> --token <mit_…>
 #   ( --server-url is optional; defaults to Multica Cloud. )
 #
 # Install CLI + provision self-host server:
