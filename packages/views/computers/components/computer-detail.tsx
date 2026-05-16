@@ -16,8 +16,9 @@ import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions } from "@multica/core/workspace/queries";
 import {
-  activeAgentsFromError,
+  computerInUseFromError,
   useDeleteComputer,
+  type ComputerInUse,
 } from "@multica/core/computers";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { Badge } from "@multica/ui/components/ui/badge";
@@ -56,7 +57,7 @@ export function ComputerDetail({ computer }: { computer: ComputerDetailType }) {
   const deleteMutation = useDeleteComputer(wsId);
 
   const [removeOpen, setRemoveOpen] = useState(false);
-  const [activeAgents, setActiveAgents] = useState<number | null>(null);
+  const [inUse, setInUse] = useState<ComputerInUse | null>(null);
 
   const currentMember = user ? members.find((m) => m.user_id === user.id) : null;
   const isAdmin = currentMember
@@ -70,7 +71,7 @@ export function ComputerDetail({ computer }: { computer: ComputerDetailType }) {
     : null;
 
   const openRemove = () => {
-    setActiveAgents(null);
+    setInUse(null);
     setRemoveOpen(true);
   };
 
@@ -82,9 +83,9 @@ export function ComputerDetail({ computer }: { computer: ComputerDetailType }) {
         navigation.push(paths.computers());
       },
       onError: (err) => {
-        const n = activeAgentsFromError(err);
-        if (n !== null) {
-          setActiveAgents(n);
+        const occupants = computerInUseFromError(err);
+        if (occupants) {
+          setInUse(occupants);
           return;
         }
         toast.error(
@@ -158,19 +159,22 @@ export function ComputerDetail({ computer }: { computer: ComputerDetailType }) {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {activeAgents !== null
+              {inUse
                 ? t(($) => $.remove.in_use_title)
                 : t(($) => $.remove.title)}
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {activeAgents !== null
-                ? t(($) => $.remove.in_use_description, { count: activeAgents })
+              {inUse
+                ? t(($) => $.remove.in_use_description, {
+                    agents: inUse.agents.length,
+                    tasks: inUse.tasks.length,
+                  })
                 : t(($) => $.remove.description)}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>{t(($) => $.remove.cancel)}</AlertDialogCancel>
-            {activeAgents === null && (
+            {!inUse && (
               <AlertDialogAction
                 variant="destructive"
                 onClick={handleConfirmRemove}
@@ -199,7 +203,7 @@ function HeroCard({
 }) {
   const { t } = useT("computers");
   const isOnline = computer.status === "online";
-  const KindIcon = kindIcon(computer.kind);
+  const KindIcon = kindIcon(computer.kind, computer.install_source);
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-start gap-3 p-4">
@@ -223,7 +227,7 @@ function HeroCard({
             </span>
           </div>
           <div className="mt-1 truncate text-xs text-muted-foreground">
-            {kindLabel(computer.kind, t)}
+            {kindLabel(computer.kind, computer.install_source, t)}
             {ownerMember && (
               <>
                 <span className="px-1.5 text-muted-foreground/50">·</span>
@@ -253,7 +257,7 @@ function OverviewPane({
 }) {
   const { t } = useT("computers");
   const facts: Array<{ label: string; value: React.ReactNode; mono?: boolean }> = [
-    { label: t(($) => $.detail.fact.kind), value: kindLabel(computer.kind, t) },
+    { label: t(($) => $.detail.fact.kind), value: kindLabel(computer.kind, computer.install_source, t) },
     {
       label: t(($) => $.detail.fact.status),
       value: computer.status === "online"
@@ -415,31 +419,28 @@ function ActivityPane({ computer }: { computer: ComputerDetailType }) {
 // Local helpers
 // ---------------------------------------------------------------------------
 
-function kindIcon(kind: ComputerDetailType["kind"]) {
-  switch (kind) {
-    case "desktop":
-      return Laptop;
-    case "cloud":
-      return Cloud;
-    default:
-      return Server;
-  }
+function kindIcon(
+  kind: ComputerDetailType["kind"],
+  installSource: ComputerDetailType["install_source"],
+) {
+  if (kind === "cloud") return Cloud;
+  if (kind === "local" && installSource === "desktop_auto") return Laptop;
+  return Server;
 }
 
 function kindLabel(
   kind: ComputerDetailType["kind"],
+  installSource: ComputerDetailType["install_source"],
   t: ReturnType<typeof useT<"computers">>["t"],
 ): string {
-  switch (kind) {
-    case "desktop":
-      return t(($) => $.list.kind.desktop);
-    case "remote":
-      return t(($) => $.list.kind.remote);
-    case "cloud":
-      return t(($) => $.list.kind.cloud);
-    default:
-      return t(($) => $.list.kind.unknown);
+  // See computers-page.computerKindLabel for the local/cloud + install_source
+  // mapping that drives the user-facing label (RFC v6.1 §3.1).
+  if (kind === "cloud") return t(($) => $.list.kind.cloud);
+  if (kind === "local") {
+    if (installSource === "desktop_auto") return t(($) => $.list.kind.desktop);
+    return t(($) => $.list.kind.remote);
   }
+  return t(($) => $.list.kind.unknown);
 }
 
 function formatDate(ts: string | null | undefined): string {

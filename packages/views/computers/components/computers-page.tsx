@@ -159,7 +159,7 @@ function ComputersTable({
                   {c.name || "(unnamed)"}
                 </AppLink>
               </td>
-              <td className="px-3 py-2 text-muted-foreground">{computerKindLabel(c.kind, t)}</td>
+              <td className="px-3 py-2 text-muted-foreground">{computerKindLabel(c.kind, c.install_source, t)}</td>
               <td className="px-3 py-2">
                 <StatusDot status={c.status} t={t} />
               </td>
@@ -195,20 +195,21 @@ function StatusDot({
 
 function computerKindLabel(
   kind: Computer["kind"],
+  installSource: Computer["install_source"],
   t: ReturnType<typeof useT<"computers">>["t"],
 ): string {
-  // Defensive default for forward-compat: a future backend kind we don't
-  // know yet renders as "unknown" rather than crashing.
-  switch (kind) {
-    case "desktop":
-      return t(($) => $.list.kind.desktop);
-    case "remote":
-      return t(($) => $.list.kind.remote);
-    case "cloud":
-      return t(($) => $.list.kind.cloud);
-    default:
-      return t(($) => $.list.kind.unknown);
+  // The user-facing split (RFC v6.1 §3.1 Overview · Kind):
+  //   This Desktop      ← local kind + install_source desktop_auto
+  //   Connected machine ← local kind + install_source script / manual / empty
+  //   Cloud             ← cloud kind
+  // Falls back to a generic "unknown" only when the server returns an enum
+  // value this client doesn't recognise yet (forward-compat).
+  if (kind === "cloud") return t(($) => $.list.kind.cloud);
+  if (kind === "local") {
+    if (installSource === "desktop_auto") return t(($) => $.list.kind.desktop);
+    return t(($) => $.list.kind.remote);
   }
+  return t(($) => $.list.kind.unknown);
 }
 
 function formatLastSeen(ts: string | null | undefined): string {

@@ -37,7 +37,9 @@
       "title": "This Desktop",
       "recommended": "Recommended",
       "description": "Use the Mac you're currently on. Already set up.",
-      "cta": "Use"
+      "cta": "Use",
+      "web_only": "Only available in the Multica Desktop app.",
+      "download_cta": "Download Desktop"
     },
     "another_machine": {
       "title": "Another machine",
@@ -68,7 +70,7 @@
     "title": "Remove this computer?",
     "description": "The daemon will stop receiving tasks from this workspace and the credential will be revoked. The machine itself is not uninstalled.",
     "in_use_title": "This computer is in use",
-    "in_use_description": "{{count}} active agent runs are bound to this computer. Stop or reassign them before removing.",
+    "in_use_description": "This computer is currently running {{tasks}} task(s) and bound to {{agents}} agent(s). Cancel the tasks and unbind the agents before removing it.",
     "confirm": "Remove",
     "cancel": "Cancel",
     "toast_removed": "Computer removed.",

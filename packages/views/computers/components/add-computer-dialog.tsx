@@ -6,6 +6,7 @@ import {
   Check,
   Cloud,
   Copy,
+  Download,
   Laptop,
   Loader2,
   Monitor,
@@ -15,6 +16,7 @@ import {
 import { toast } from "sonner";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@multica/core/api";
+import { detectClientType } from "@multica/core/analytics";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useWorkspaceSlug } from "@multica/core/paths";
 import { computerKeys, computerListOptions } from "@multica/core/computers";
@@ -62,11 +64,18 @@ export function AddComputerDialog({
     if (open) setStep("select");
   }, [open]);
 
+  // RFC v6.1 §1.3: Web swaps the "This Desktop" card for a "Only available in
+  // Desktop" info card. We can't ship a daemon inside the browser tab, so the
+  // Web variant just nudges the user toward the Desktop download instead of
+  // pretending the option is real and silently dropping the click.
+  const platform = detectClientType(); // "web" | "desktop"
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-xl">
         {step === "select" ? (
           <SelectStep
+            platform={platform}
             onPickThisDesktop={() => {
               onOpenChange(false);
             }}
@@ -93,10 +102,12 @@ export function AddComputerDialog({
 // ---------------------------------------------------------------------------
 
 function SelectStep({
+  platform,
   onPickThisDesktop,
   onPickAnother,
   onClose,
 }: {
+  platform: "web" | "desktop";
   onPickThisDesktop: () => void;
   onPickAnother: () => void;
   onClose: () => void;
@@ -110,14 +121,26 @@ function SelectStep({
       </DialogHeader>
 
       <div className="flex flex-col gap-2">
-        <Choice
-          icon={<Laptop className="h-4 w-4" />}
-          title={t(($) => $.add.this_desktop.title)}
-          badge={t(($) => $.add.this_desktop.recommended)}
-          description={t(($) => $.add.this_desktop.description)}
-          cta={t(($) => $.add.this_desktop.cta)}
-          onClick={onPickThisDesktop}
-        />
+        {platform === "desktop" ? (
+          <Choice
+            icon={<Laptop className="h-4 w-4" />}
+            title={t(($) => $.add.this_desktop.title)}
+            badge={t(($) => $.add.this_desktop.recommended)}
+            description={t(($) => $.add.this_desktop.description)}
+            cta={t(($) => $.add.this_desktop.cta)}
+            onClick={onPickThisDesktop}
+          />
+        ) : (
+          <Choice
+            icon={<Laptop className="h-4 w-4" />}
+            title={t(($) => $.add.this_desktop.title)}
+            description={t(($) => $.add.this_desktop.web_only)}
+            cta={t(($) => $.add.this_desktop.download_cta)}
+            href="https://multica.ai/download"
+            external
+            ctaIcon={<Download className="h-3 w-3" />}
+          />
+        )}
         <Choice
           icon={<Server className="h-4 w-4" />}
           title={t(($) => $.add.another_machine.title)}
@@ -150,7 +173,10 @@ function Choice({
   badge,
   description,
   cta,
+  ctaIcon,
   onClick,
+  href,
+  external,
   disabled,
 }: {
   icon: React.ReactNode;
@@ -158,20 +184,19 @@ function Choice({
   badge?: string;
   description: string;
   cta: string;
+  ctaIcon?: React.ReactNode;
   onClick?: () => void;
+  // `href` switches the card to an <a target=_blank> for the Web "Download
+  // Desktop" affordance (RFC v6.1 §1.3): the card stays visually present so
+  // the user knows This Desktop is a real option, but click escapes to a
+  // download page instead of pretending we can register a daemon from the
+  // browser tab.
+  href?: string;
+  external?: boolean;
   disabled?: boolean;
 }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      className={`group flex w-full items-center gap-3 rounded-md border bg-card p-3 text-left transition-colors ${
-        disabled
-          ? "cursor-not-allowed opacity-60"
-          : "hover:border-foreground/20 hover:bg-accent/30"
-      }`}
-    >
+  const body = (
+    <>
       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border bg-background text-muted-foreground">
         {icon}
       </div>
@@ -186,9 +211,37 @@ function Choice({
         </div>
         <p className="mt-0.5 truncate text-xs text-muted-foreground">{description}</p>
       </div>
-      <span className="shrink-0 text-xs font-medium text-muted-foreground group-hover:text-foreground">
+      <span className="flex shrink-0 items-center gap-1 text-xs font-medium text-muted-foreground group-hover:text-foreground">
+        {ctaIcon}
         {cta}
       </span>
+    </>
+  );
+  const className = `group flex w-full items-center gap-3 rounded-md border bg-card p-3 text-left transition-colors ${
+    disabled
+      ? "cursor-not-allowed opacity-60"
+      : "hover:border-foreground/20 hover:bg-accent/30"
+  }`;
+  if (href) {
+    return (
+      <a
+        href={href}
+        target={external ? "_blank" : undefined}
+        rel={external ? "noopener noreferrer" : undefined}
+        className={className}
+      >
+        {body}
+      </a>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={className}
+    >
+      {body}
     </button>
   );
 }

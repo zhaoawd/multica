@@ -37,7 +37,9 @@
       "title": "当前桌面",
       "recommended": "推荐",
       "description": "使用你当前使用的 Mac，已自动配置好。",
-      "cta": "使用"
+      "cta": "使用",
+      "web_only": "仅在 Multica 桌面应用中可用。",
+      "download_cta": "下载桌面端"
     },
     "another_machine": {
       "title": "其他机器",
@@ -68,7 +70,7 @@
     "title": "确定要移除这台电脑？",
     "description": "守护进程将不再从本工作区获取任务，凭据会被吊销。机器本身不会被卸载。",
     "in_use_title": "这台电脑正在使用中",
-    "in_use_description": "有 {{count}} 个活跃的 Agent 任务还在这台电脑上运行，请先停止或转交。",
+    "in_use_description": "这台电脑当前还在跑 {{tasks}} 个任务，并绑定了 {{agents}} 个 Agent。请先取消任务并解绑 Agent，再来移除。",
     "confirm": "移除",
     "cancel": "取消",
     "toast_removed": "已移除电脑。",

@@ -41,16 +41,30 @@ export type AgentRuntime = RuntimeDevice;
 // that haven't shipped /api/computers will 404; the UI must degrade
 // gracefully (use the runtime list as a fallback). Cards that depend on a
 // single field should optional-chain — every field can be missing.
-export type ComputerKind = "desktop" | "remote" | "cloud" | "unknown";
+//
+// `kind` mirrors `agent_runtime.runtime_mode` (D3: `kind := runtime_mode`)
+// and only carries the deployment shape: local vs cloud. The user-facing
+// "This Desktop" / "Connected machine" / "Cloud" split is derived from
+// `install_source` at render time, not encoded here — that keeps the API
+// type aligned with the server contract and avoids drift the moment we
+// add another install source (e.g. `docker`, `package_manager`).
+export type ComputerKind = "local" | "cloud" | "unknown";
+
+/** install_source values written into agent_runtime.metadata (D3). */
+export type ComputerInstallSource =
+  | "desktop_auto"
+  | "script"
+  | "manual"
+  | "";
 
 export interface Computer {
   id: string; // = daemon_id, per D1
   workspace_id: string;
   name: string;
-  /** Coarse classifier derived from runtime_mode + metadata.install_source. */
+  /** Deployment shape from `agent_runtime.runtime_mode`. */
   kind: ComputerKind;
   device_info: string;
-  install_source: string;
+  install_source: ComputerInstallSource;
   metadata: Record<string, unknown>;
   owner_id: string | null;
   status: "online" | "offline";
