@@ -5,28 +5,28 @@ import { Monitor, Plus, Search } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { computerListOptions } from "@multica/core/computers";
+import { useWorkspacePaths } from "@multica/core/paths";
 import type { Computer } from "@multica/core/types";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
+import { AppLink, useNavigation } from "../../navigation";
 import { PageHeader } from "../../layout/page-header";
 import { useT } from "../../i18n";
+import { AddComputerDialog } from "./add-computer-dialog";
 
-// RFC v6.1 / §1.2-1.3: Computers index page. Minimal in this commit — list
-// + Add Computer entry point. The 3-card Add Computer modal, install-page
-// polling, detail tabs, and Remove confirm dialog land in follow-up commits
-// on the same PR. Until those ship, Add Computer routes to the legacy
-// /runtimes connect-remote flow as a graceful fallback (handled by the
-// route layer, not this component) so users on canary builds still have an
-// onboarding path.
-export interface ComputersPageProps {
-  onAddComputer?: () => void;
-}
-
-export function ComputersPage({ onAddComputer }: ComputersPageProps = {}) {
+// RFC v6.1 / §1.2-1.3: Computers index page. Owns the Add Computer modal
+// state internally so both apps (web + desktop) get the same flow without
+// needing per-platform wiring. The modal mints an install token, shows the
+// one-liner, and detects new daemon registration via polling + the
+// platform-wide daemon:* WS invalidation.
+export function ComputersPage() {
   const wsId = useWorkspaceId();
+  const paths = useWorkspacePaths();
+  const navigation = useNavigation();
   const { t } = useT("computers");
   const [search, setSearch] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
 
   // `wsId` is guaranteed by WorkspaceRouteLayout for any route nested under
   // /:slug. We still guard with `enabled` so an in-flight workspace switch
@@ -46,6 +46,17 @@ export function ComputersPage({ onAddComputer }: ComputersPageProps = {}) {
     );
   }, [computers, search]);
 
+  // Snapshot the computer IDs that exist the moment the user opens the
+  // dialog. The install step uses this to detect "a *new* computer
+  // appeared" rather than just "a computer is in the list" — otherwise the
+  // step would auto-close on open whenever the workspace already has
+  // computers.
+  const [knownIds, setKnownIds] = useState<Set<string>>(new Set());
+  const openAdd = () => {
+    setKnownIds(new Set(computers.map((c) => c.id)));
+    setAddOpen(true);
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
       <PageHeader className="justify-between px-5">
@@ -63,7 +74,7 @@ export function ComputersPage({ onAddComputer }: ComputersPageProps = {}) {
               className="h-8 w-56 pl-7 text-sm"
             />
           </div>
-          <Button size="sm" onClick={onAddComputer}>
+          <Button size="sm" onClick={openAdd}>
             <Plus className="size-3.5" />
             {t(($) => $.page.add_computer)}
           </Button>
@@ -78,11 +89,20 @@ export function ComputersPage({ onAddComputer }: ComputersPageProps = {}) {
             <Skeleton className="h-10 w-full" />
           </div>
         ) : filtered.length === 0 ? (
-          <EmptyState query={search} onAddComputer={onAddComputer} />
+          <EmptyState query={search} onAddComputer={openAdd} />
         ) : (
-          <ComputersTable rows={filtered} />
+          <ComputersTable rows={filtered} hrefFor={(id) => paths.computerDetail(id)} />
         )}
       </div>
+
+      <AddComputerDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        knownComputerIds={knownIds}
+        onConnected={(id) => {
+          navigation.push(paths.computerDetail(id));
+        }}
+      />
     </div>
   );
 }
@@ -111,7 +131,13 @@ function EmptyState({ query, onAddComputer }: { query: string; onAddComputer?: (
   );
 }
 
-function ComputersTable({ rows }: { rows: Computer[] }) {
+function ComputersTable({
+  rows,
+  hrefFor,
+}: {
+  rows: Computer[];
+  hrefFor: (id: string) => string;
+}) {
   const { t } = useT("computers");
   return (
     <div className="overflow-x-auto rounded-md border">
@@ -128,7 +154,11 @@ function ComputersTable({ rows }: { rows: Computer[] }) {
         <tbody>
           {rows.map((c) => (
             <tr key={c.id} className="border-t hover:bg-muted/30">
-              <td className="px-3 py-2 font-medium">{c.name || "(unnamed)"}</td>
+              <td className="px-3 py-2 font-medium">
+                <AppLink href={hrefFor(c.id)} className="hover:underline">
+                  {c.name || "(unnamed)"}
+                </AppLink>
+              </td>
               <td className="px-3 py-2 text-muted-foreground">{computerKindLabel(c.kind, t)}</td>
               <td className="px-3 py-2">
                 <StatusDot status={c.status} t={t} />

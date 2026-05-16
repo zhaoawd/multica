@@ -14,6 +14,7 @@ import { projectKeys } from "../projects/queries";
 import { pinKeys } from "../pins/queries";
 import { autopilotKeys } from "../autopilots/queries";
 import { runtimeKeys } from "../runtimes/queries";
+import { computerKeys } from "../computers/queries";
 import {
   agentTaskSnapshotKeys,
   agentActivityKeys,
@@ -122,6 +123,7 @@ function invalidateWorkspaceScopedQueries(qc: QueryClient): void {
     qc.invalidateQueries({ queryKey: workspaceKeys.skills(wsId) });
     qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
     qc.invalidateQueries({ queryKey: runtimeKeys.all(wsId) });
+    qc.invalidateQueries({ queryKey: computerKeys.all(wsId) });
     qc.invalidateQueries({ queryKey: autopilotKeys.all(wsId) });
     qc.invalidateQueries({ queryKey: agentTaskSnapshotKeys.all(wsId) });
     qc.invalidateQueries({ queryKey: agentActivityKeys.all(wsId) });
@@ -220,7 +222,14 @@ export function useRealtimeSync(
       },
       daemon: () => {
         const wsId = getCurrentWsId();
-        if (wsId) qc.invalidateQueries({ queryKey: runtimeKeys.all(wsId) });
+        if (wsId) {
+          qc.invalidateQueries({ queryKey: runtimeKeys.all(wsId) });
+          // Computer list is daemon-id-keyed (RFC v6.1 §6.2), so any daemon
+          // register / heartbeat that flips status or surfaces a new
+          // computer needs the same invalidation. Skipping this kept the
+          // Add Computer install step polling-only.
+          qc.invalidateQueries({ queryKey: computerKeys.all(wsId) });
+        }
       },
       autopilot: () => {
         const wsId = getCurrentWsId();
