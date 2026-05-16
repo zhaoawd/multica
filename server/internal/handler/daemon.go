@@ -329,6 +329,8 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 	var ownerID pgtype.UUID
 	installSource := "" // empty => UpsertAgentRuntime keeps the prior metadata
 	daemonTokenAuth := false
+	var daemonTokenMember db.Member
+	daemonTokenMemberValid := false
 	if daemonWsID := middleware.DaemonWorkspaceIDFromContext(r.Context()); daemonWsID != "" {
 		daemonTokenAuth = true
 		if daemonWsID != req.WorkspaceID {
@@ -345,6 +347,20 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		}); err == nil {
 			if info.CreatedByUserID.Valid {
 				ownerID = info.CreatedByUserID
+				daemonTokenMember = db.Member{
+					WorkspaceID: wsUUID,
+					UserID:      info.CreatedByUserID,
+					Role:        "member",
+				}
+				if member, memberErr := h.Queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+					UserID:      info.CreatedByUserID,
+					WorkspaceID: wsUUID,
+				}); memberErr == nil {
+					daemonTokenMember = member
+				} else {
+					slog.Warn("daemon register: install token issuer membership lookup failed", "error", memberErr, "workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID)
+				}
+				daemonTokenMemberValid = true
 			}
 			if info.InstallSource.Valid {
 				installSource = info.InstallSource.String
@@ -373,6 +389,19 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		// per-runtime loop, since this scope hasn't seen `req.LaunchedBy` yet
 		// in a clean way — set a sentinel ("__pat__") and resolve below.
 		installSource = "__pat__"
+	}
+
+	if daemonTokenAuth && daemonTokenMemberValid {
+		takeover, err := daemonIDOwnedByAnotherMember(r.Context(), h.Queries, wsUUID, req.DaemonID, daemonTokenMember)
+		if err != nil {
+			slog.Error("daemon register: takeover check failed", "error", err, "workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID)
+			writeError(w, http.StatusInternalServerError, "failed to register runtime")
+			return
+		}
+		if takeover {
+			writeError(w, http.StatusForbidden, "daemon_id already belongs to another member")
+			return
+		}
 	}
 
 	ws, err := h.Queries.GetWorkspace(r.Context(), wsUUID)

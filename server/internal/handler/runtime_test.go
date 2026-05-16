@@ -393,3 +393,54 @@ func TestUpsertAgentRuntimePreservesTimezoneOverride(t *testing.T) {
 		t.Fatalf("daemon reconnect should preserve user override, got %q", row.Timezone)
 	}
 }
+
+func TestUpsertAgentRuntimePreservesExistingOwner(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	originalOwnerID := createHandlerTestMember(t, "member")
+	newOwnerID := createHandlerTestMember(t, "member")
+
+	testPool.Exec(ctx, `
+		DELETE FROM agent_runtime
+		 WHERE workspace_id = $1 AND daemon_id = 'owner-upsert-daemon' AND provider = 'owner-upsert-provider'
+	`, testWorkspaceID)
+	row, err := testHandler.Queries.UpsertAgentRuntime(ctx, db.UpsertAgentRuntimeParams{
+		WorkspaceID: parseUUID(testWorkspaceID),
+		DaemonID:    strToText("owner-upsert-daemon"),
+		Name:        "Owner Upsert Runtime",
+		RuntimeMode: "local",
+		Provider:    "owner-upsert-provider",
+		Status:      "online",
+		DeviceInfo:  "owner-upsert-device",
+		Metadata:    []byte(`{"install_source":"script"}`),
+		OwnerID:     parseUUID(originalOwnerID),
+		Timezone:    "UTC",
+	})
+	if err != nil {
+		t.Fatalf("initial upsert: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, row.ID)
+	})
+
+	row, err = testHandler.Queries.UpsertAgentRuntime(ctx, db.UpsertAgentRuntimeParams{
+		WorkspaceID: parseUUID(testWorkspaceID),
+		DaemonID:    strToText("owner-upsert-daemon"),
+		Name:        "Owner Upsert Runtime Reconnect",
+		RuntimeMode: "local",
+		Provider:    "owner-upsert-provider",
+		Status:      "online",
+		DeviceInfo:  "owner-upsert-device reconnect",
+		Metadata:    []byte(`{"install_source":"script"}`),
+		OwnerID:     parseUUID(newOwnerID),
+		Timezone:    "UTC",
+	})
+	if err != nil {
+		t.Fatalf("reconnect upsert: %v", err)
+	}
+	if uuidToString(row.OwnerID) != originalOwnerID {
+		t.Fatalf("upsert overwrote existing owner: got %s want %s", uuidToString(row.OwnerID), originalOwnerID)
+	}
+}

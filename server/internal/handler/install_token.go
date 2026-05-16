@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -117,13 +118,28 @@ func (h *Handler) ExchangeInstallToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	consumed, err := h.Queries.ConsumeInstallToken(r.Context(), auth.HashToken(body.Token))
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		slog.Error("exchange install token: begin tx", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to exchange install token")
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(r.Context())
+		}
+	}()
+	qtx := h.Queries.WithTx(tx)
+
+	tokenHash := auth.HashToken(body.Token)
+	consumed, err := qtx.ConsumeInstallToken(r.Context(), tokenHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Either never existed, already used, or expired. Distinguish
 			// "already used" from "expired/unknown" with a follow-up read
 			// so the install.sh can surface the precise error.
-			existing, lookupErr := h.Queries.GetInstallToken(r.Context(), auth.HashToken(body.Token))
+			existing, lookupErr := qtx.GetInstallToken(r.Context(), tokenHash)
 			if lookupErr == nil && existing.UsedAt.Valid {
 				writeError(w, http.StatusUnauthorized, "install_token_already_used")
 				return
@@ -136,6 +152,25 @@ func (h *Handler) ExchangeInstallToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	issuer, err := qtx.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+		UserID:      consumed.CreatedByUserID,
+		WorkspaceID: consumed.WorkspaceID,
+	})
+	if err != nil {
+		writeError(w, http.StatusForbidden, "install token issuer is not a workspace member")
+		return
+	}
+	takeover, err := daemonIDOwnedByAnotherMember(r.Context(), qtx, consumed.WorkspaceID, body.DaemonID, issuer)
+	if err != nil {
+		slog.Error("exchange install token: takeover check failed", "error", err, "workspace_id", uuidToString(consumed.WorkspaceID), "daemon_id", body.DaemonID)
+		writeError(w, http.StatusInternalServerError, "failed to exchange install token")
+		return
+	}
+	if takeover {
+		writeError(w, http.StatusForbidden, "daemon_id already belongs to another member")
+		return
+	}
+
 	daemonToken, err := auth.GenerateDaemonToken()
 	if err != nil {
 		slog.Error("exchange install token: generate daemon token", "error", err)
@@ -144,7 +179,7 @@ func (h *Handler) ExchangeInstallToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	expiresAt := time.Now().Add(daemonTokenLifetime)
-	row, err := h.Queries.CreateDaemonToken(r.Context(), db.CreateDaemonTokenParams{
+	row, err := qtx.CreateDaemonToken(r.Context(), db.CreateDaemonTokenParams{
 		TokenHash:   auth.HashToken(daemonToken),
 		WorkspaceID: consumed.WorkspaceID,
 		DaemonID:    body.DaemonID,
@@ -163,6 +198,12 @@ func (h *Handler) ExchangeInstallToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to issue daemon token")
 		return
 	}
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Error("exchange install token: commit", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to exchange install token")
+		return
+	}
+	committed = true
 
 	slog.Info(
 		"install token exchanged",
@@ -176,6 +217,26 @@ func (h *Handler) ExchangeInstallToken(w http.ResponseWriter, r *http.Request) {
 		DaemonID:    body.DaemonID,
 		ExpiresAt:   timestampToString(row.ExpiresAt),
 	})
+}
+
+func daemonIDOwnedByAnotherMember(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID, daemonID string, member db.Member) (bool, error) {
+	if roleAllowed(member.Role, "owner", "admin") {
+		return false, nil
+	}
+	runtimes, err := q.ListAgentRuntimesByDaemon(ctx, db.ListAgentRuntimesByDaemonParams{
+		WorkspaceID: workspaceID,
+		DaemonID:    strToText(daemonID),
+	})
+	if err != nil {
+		return false, err
+	}
+	memberID := uuidToString(member.UserID)
+	for _, rt := range runtimes {
+		if rt.OwnerID.Valid && uuidToString(rt.OwnerID) != memberID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // generateInstallToken: 20 random bytes hex-encoded with a `mit_` prefix,
