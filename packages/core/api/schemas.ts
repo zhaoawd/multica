@@ -5,6 +5,7 @@ import type {
   AgentTemplateSummary,
   Attachment,
   CreateAgentFromTemplateResponse,
+  LarkBindingResponse,
   ListIssuesResponse,
   TimelineEntry,
 } from "../types";
@@ -305,4 +306,25 @@ export const EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE: CreateAgentFromTemplateR
   agent: { id: "" } as Agent,
   imported_skill_ids: [],
   reused_skill_ids: [],
+};
+
+// Lark binding response — kept lenient so a future server-side field doesn't
+// strip out fields the UI hasn't claimed yet, and so unknown event-key strings
+// in `enabled_events`/`supported_events` survive validation (the UI renders
+// unknowns as inactive entries rather than blowing up).
+export const LarkBindingResponseSchema = z.object({
+  bound: z.boolean(),
+  configured: z.boolean(),
+  chat_id: z.string().optional(),
+  enabled_events: z.array(z.string()).default([]),
+  supported_events: z.array(z.string()).default([]),
+  created_at: z.string().optional(),
+  updated_at: z.string().optional(),
+}).loose();
+
+export const EMPTY_LARK_BINDING: LarkBindingResponse = {
+  bound: false,
+  configured: false,
+  enabled_events: [],
+  supported_events: [],
 };

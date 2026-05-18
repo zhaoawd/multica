@@ -84,6 +84,12 @@ export type {
   GitHubConnectResponse,
 } from "./github";
 export type {
+  LarkEventKind,
+  LarkBindingResponse,
+  UpsertLarkBindingRequest,
+  PatchLarkBindingRequest,
+} from "./lark";
+export type {
   Autopilot,
   AutopilotStatus,
   AutopilotExecutionMode,

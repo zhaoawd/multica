@@ -306,6 +306,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/github/installations", h.ListGitHubInstallations)
 					r.Delete("/github/installations/{installationId}", h.DeleteGitHubInstallation)
 				})
+
+				// Lark integration — admin-only, same nesting as GitHub.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
+					r.Get("/lark/binding", h.GetLarkBinding)
+					r.Post("/lark/binding", h.UpsertLarkBinding)
+					r.Patch("/lark/binding", h.PatchLarkBinding)
+					r.Delete("/lark/binding", h.DeleteLarkBinding)
+				})
 			})
 		})
 

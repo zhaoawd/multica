@@ -255,6 +255,15 @@ func main() {
 	registerSubscriberListeners(bus, queries)
 	registerActivityListeners(bus, queries)
 	registerNotificationListeners(bus, queries)
+	// Lark outbound notifier — no-op when LARK_* env is not set. Registered
+	// regardless so a freshly-configured deployment doesn't need a restart
+	// to start emitting cards once a binding is created via the UI.
+	// Start() launches the worker pool that handles HTTP fan-out off the
+	// synchronous event-bus path — Lark outages must not stall issue /
+	// comment / task writes.
+	larkNotify := service.NewLarkNotify(queries)
+	larkNotify.Start()
+	registerLarkListeners(bus, larkNotify, queries)
 
 	metricsConfig := obsmetrics.ConfigFromEnv()
 	var metricsServer *http.Server
@@ -359,6 +368,15 @@ func main() {
 	// final batch of queued heartbeat bumps.
 	sweepCancel()
 	heartbeatScheduler.Stop()
+
+	// HTTP listener is closed; signal Lark workers to exit. Background
+	// goroutines (sweepers, autopilot) have been cancelled but not
+	// joined yet, so a late bus publish may still race with Stop; the
+	// stopping flag inside LarkNotify swallows that. Bounded to 5s so
+	// a Lark outage at shutdown can't pin process exit on stuck sends.
+	larkShutdownCtx, larkShutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	larkNotify.Stop(larkShutdownCtx)
+	larkShutdownCancel()
 
 	if metricsServer != nil {
 		metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)

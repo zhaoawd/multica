@@ -91,6 +91,9 @@ import type {
   GitHubPullRequest,
   ListGitHubInstallationsResponse,
   GitHubConnectResponse,
+  LarkBindingResponse,
+  UpsertLarkBindingRequest,
+  PatchLarkBindingRequest,
   Squad,
   SquadMember,
 } from "../types";
@@ -113,8 +116,10 @@ import {
   EMPTY_AGENT_TEMPLATE_SUMMARY_LIST,
   EMPTY_ATTACHMENT,
   EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE,
+  EMPTY_LARK_BINDING,
   EMPTY_LIST_ISSUES_RESPONSE,
   EMPTY_TIMELINE_ENTRIES,
+  LarkBindingResponseSchema,
   ListIssuesResponseSchema,
   SubscribersListSchema,
   TimelineEntriesSchema,
@@ -1562,5 +1567,37 @@ export class ApiClient {
 
   async listIssuePullRequests(issueId: string): Promise<{ pull_requests: GitHubPullRequest[] }> {
     return this.fetch(`/api/issues/${issueId}/pull-requests`);
+  }
+
+  // Lark (Feishu) integration — workspace binding.
+  async getLarkBinding(workspaceId: string): Promise<LarkBindingResponse> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/lark/binding`);
+    return parseWithFallback(raw, LarkBindingResponseSchema, EMPTY_LARK_BINDING, {
+      endpoint: "GET /api/workspaces/:id/lark/binding",
+    });
+  }
+
+  async upsertLarkBinding(workspaceId: string, body: UpsertLarkBindingRequest): Promise<LarkBindingResponse> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/lark/binding`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return parseWithFallback(raw, LarkBindingResponseSchema, EMPTY_LARK_BINDING, {
+      endpoint: "POST /api/workspaces/:id/lark/binding",
+    });
+  }
+
+  async patchLarkBinding(workspaceId: string, body: PatchLarkBindingRequest): Promise<LarkBindingResponse> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/lark/binding`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+    return parseWithFallback(raw, LarkBindingResponseSchema, EMPTY_LARK_BINDING, {
+      endpoint: "PATCH /api/workspaces/:id/lark/binding",
+    });
+  }
+
+  async deleteLarkBinding(workspaceId: string): Promise<void> {
+    await this.fetch(`/api/workspaces/${workspaceId}/lark/binding`, { method: "DELETE" });
   }
 }
