@@ -219,6 +219,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Post("/api/webhooks/github", h.HandleGitHubWebhook)
 	r.Get("/api/github/setup", h.GitHubSetupCallback)
 
+	// Lark user-OAuth callback (no Multica auth — state HMAC carries the
+	// initiating user_id, signed with LARK_VERIFICATION_TOKEN).
+	r.Get("/api/lark/oauth/callback", h.LarkUserOAuthCallback)
+
 	// Daemon API routes (require daemon token or valid user token)
 	r.Route("/api/daemon", func(r chi.Router) {
 		r.Use(middleware.DaemonAuth(queries, patCache, daemonTokenCache))
@@ -267,6 +271,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/api/me/onboarding/cloud-waitlist", h.JoinCloudWaitlist)
 		r.Post("/api/me/starter-content/import", h.ImportStarterContent)
 		r.Post("/api/me/starter-content/dismiss", h.DismissStarterContent)
+
+		// Per-user Lark account link (one row in lark_user_link).
+		r.Get("/api/users/me/lark/link", h.GetMyLarkUserLink)
+		r.Post("/api/users/me/lark/link", h.StartLarkUserLink)
+		r.Delete("/api/users/me/lark/link", h.DeleteMyLarkUserLink)
 		r.Post("/api/cli-token", h.IssueCliToken)
 		r.Post("/api/upload-file", h.UploadFile)
 		r.Post("/api/feedback", h.CreateFeedback)

@@ -11,6 +11,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteLarkUserLink = `-- name: DeleteLarkUserLink :exec
+DELETE FROM lark_user_link WHERE user_id = $1
+`
+
+func (q *Queries) DeleteLarkUserLink(ctx context.Context, userID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteLarkUserLink, userID)
+	return err
+}
+
 const deleteLarkWorkspaceBinding = `-- name: DeleteLarkWorkspaceBinding :exec
 DELETE FROM lark_workspace_binding WHERE workspace_id = $1
 `
@@ -18,6 +27,44 @@ DELETE FROM lark_workspace_binding WHERE workspace_id = $1
 func (q *Queries) DeleteLarkWorkspaceBinding(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteLarkWorkspaceBinding, workspaceID)
 	return err
+}
+
+const getLarkUserLink = `-- name: GetLarkUserLink :one
+
+SELECT user_id, lark_open_id, refresh_token_enc, linked_at FROM lark_user_link
+WHERE user_id = $1
+`
+
+// =====================
+// Lark user link
+// =====================
+func (q *Queries) GetLarkUserLink(ctx context.Context, userID pgtype.UUID) (LarkUserLink, error) {
+	row := q.db.QueryRow(ctx, getLarkUserLink, userID)
+	var i LarkUserLink
+	err := row.Scan(
+		&i.UserID,
+		&i.LarkOpenID,
+		&i.RefreshTokenEnc,
+		&i.LinkedAt,
+	)
+	return i, err
+}
+
+const getLarkUserLinkByOpenID = `-- name: GetLarkUserLinkByOpenID :one
+SELECT user_id, lark_open_id, refresh_token_enc, linked_at FROM lark_user_link
+WHERE lark_open_id = $1
+`
+
+func (q *Queries) GetLarkUserLinkByOpenID(ctx context.Context, larkOpenID string) (LarkUserLink, error) {
+	row := q.db.QueryRow(ctx, getLarkUserLinkByOpenID, larkOpenID)
+	var i LarkUserLink
+	err := row.Scan(
+		&i.UserID,
+		&i.LarkOpenID,
+		&i.RefreshTokenEnc,
+		&i.LinkedAt,
+	)
+	return i, err
 }
 
 const getLarkWorkspaceBinding = `-- name: GetLarkWorkspaceBinding :one
@@ -98,6 +145,37 @@ func (q *Queries) UpdateLarkWorkspaceBindingEvents(ctx context.Context, arg Upda
 		&i.EnabledEvents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const upsertLarkUserLink = `-- name: UpsertLarkUserLink :one
+INSERT INTO lark_user_link (
+    user_id, lark_open_id, refresh_token_enc
+) VALUES (
+    $1, $2, $3
+)
+ON CONFLICT (user_id) DO UPDATE SET
+    lark_open_id      = EXCLUDED.lark_open_id,
+    refresh_token_enc = EXCLUDED.refresh_token_enc,
+    linked_at         = now()
+RETURNING user_id, lark_open_id, refresh_token_enc, linked_at
+`
+
+type UpsertLarkUserLinkParams struct {
+	UserID          pgtype.UUID `json:"user_id"`
+	LarkOpenID      string      `json:"lark_open_id"`
+	RefreshTokenEnc []byte      `json:"refresh_token_enc"`
+}
+
+func (q *Queries) UpsertLarkUserLink(ctx context.Context, arg UpsertLarkUserLinkParams) (LarkUserLink, error) {
+	row := q.db.QueryRow(ctx, upsertLarkUserLink, arg.UserID, arg.LarkOpenID, arg.RefreshTokenEnc)
+	var i LarkUserLink
+	err := row.Scan(
+		&i.UserID,
+		&i.LarkOpenID,
+		&i.RefreshTokenEnc,
+		&i.LinkedAt,
 	)
 	return i, err
 }

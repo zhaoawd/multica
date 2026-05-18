@@ -36,3 +36,22 @@ export interface UpsertLarkBindingRequest {
 export interface PatchLarkBindingRequest {
   enabled_events: string[];
 }
+
+/**
+ * Phase 2 — per-user Lark account link.
+ *
+ * `linked` flips true once the user has completed OAuth at least once.
+ * `configured` mirrors the workspace-binding flag so the UI can hide the
+ * Connect affordance entirely on deployments missing LARK_APP_ID etc.
+ */
+export interface LarkUserLinkResponse {
+  linked: boolean;
+  configured: boolean;
+  open_id?: string;
+  linked_at?: string;
+}
+
+/** Response from POST /api/users/me/lark/link — the URL the browser must navigate to. */
+export interface StartLarkUserLinkResponse {
+  url: string;
+}

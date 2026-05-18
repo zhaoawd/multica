@@ -88,6 +88,8 @@ export type {
   LarkBindingResponse,
   UpsertLarkBindingRequest,
   PatchLarkBindingRequest,
+  LarkUserLinkResponse,
+  StartLarkUserLinkResponse,
 } from "./lark";
 export type {
   Autopilot,

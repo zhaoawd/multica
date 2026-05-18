@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -39,6 +40,8 @@ const (
 	larkAPIBase             = "https://open.feishu.cn/open-apis"
 	larkTokenPath           = "/auth/v3/tenant_access_token/internal"
 	larkSendMessagePath     = "/im/v1/messages?receive_id_type=chat_id"
+	larkAuthorizeURL        = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
+	larkOIDCAccessTokenPath = "/authen/v1/oidc/access_token"
 	larkTokenSafetyMargin   = 60 * time.Second // refresh slightly before expiry
 	larkDefaultHTTPTimeout  = 10 * time.Second
 )
@@ -194,7 +197,108 @@ func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, car
 	return nil
 }
 
-// ── Bot token encryption (placeholder for P2+ per-workspace bot tokens) ─────
+// ── User OAuth (P2) ─────────────────────────────────────────────────────────
+
+// LarkOIDCResult is the subset of fields we use from the OIDC token
+// endpoint. Lark returns more (avatar, en_name, mobile, employee_id, ...) but
+// P2 only needs the identity (open_id) and a refresh token to mint future
+// user-scoped access tokens. The optional Name / Email are stored only to
+// improve the UI ("connected as <name>") — they are not persisted.
+type LarkOIDCResult struct {
+	OpenID       string
+	UnionID      string
+	AccessToken  string
+	RefreshToken string
+	Name         string
+	Email        string
+	AvatarURL    string
+}
+
+// BuildAuthorizeURL returns the Feishu OAuth authorize URL the browser must
+// be redirected to. state is opaque to Lark; the caller HMAC-signs it and
+// re-verifies on the callback to prevent CSRF.
+//
+// redirect_uri must match what the Lark app's "Security settings" allows.
+// We don't validate that here — Lark rejects mismatches at the authorize step
+// with a clear error message, which is the right place for the operator to
+// see it.
+func (c *LarkClient) BuildAuthorizeURL(redirectURI, state string) string {
+	q := url.Values{}
+	q.Set("app_id", c.cfg.AppID)
+	q.Set("redirect_uri", redirectURI)
+	q.Set("state", state)
+	return larkAuthorizeURL + "?" + q.Encode()
+}
+
+// ExchangeOIDCCode swaps the OAuth ?code returned on the callback for the
+// user's open_id, a short-lived user access_token and a longer-lived
+// refresh_token. Uses the app-level tenant_access_token as the Bearer for
+// the exchange call, per Lark's v1 OIDC flow.
+//
+// Errors are returned verbatim with the Lark code/msg so an operator
+// reading server logs can tell "wrong app secret" from "expired code" from
+// "redirect_uri mismatch" without needing to dig into the SDK.
+func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOIDCResult, error) {
+	if !c.cfg.Configured() {
+		return LarkOIDCResult{}, errors.New("lark not configured")
+	}
+	if strings.TrimSpace(code) == "" {
+		return LarkOIDCResult{}, errors.New("code required")
+	}
+	appToken, err := c.tenantAccessToken(ctx)
+	if err != nil {
+		return LarkOIDCResult{}, err
+	}
+	body, err := json.Marshal(map[string]string{
+		"grant_type": "authorization_code",
+		"code":       code,
+	})
+	if err != nil {
+		return LarkOIDCResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, larkAPIBase+larkOIDCAccessTokenPath, bytes.NewReader(body))
+	if err != nil {
+		return LarkOIDCResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+appToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return LarkOIDCResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			OpenID       string `json:"open_id"`
+			UnionID      string `json:"union_id"`
+			Name         string `json:"name"`
+			Email        string `json:"email"`
+			AvatarURL    string `json:"avatar_url"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return LarkOIDCResult{}, fmt.Errorf("lark oidc: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if out.Code != 0 || out.Data.OpenID == "" {
+		return LarkOIDCResult{}, fmt.Errorf("lark oidc: code=%d msg=%s", out.Code, out.Msg)
+	}
+	return LarkOIDCResult{
+		OpenID:       out.Data.OpenID,
+		UnionID:      out.Data.UnionID,
+		AccessToken:  out.Data.AccessToken,
+		RefreshToken: out.Data.RefreshToken,
+		Name:         out.Data.Name,
+		Email:        out.Data.Email,
+		AvatarURL:    out.Data.AvatarURL,
+	}, nil
+}
+
+// ── Bot / refresh-token encryption (shared between P1 bot_token_enc and P2 user refresh_token_enc) ─────
 
 // EncryptBotToken AES-GCM-encrypts a bot token with LARK_ENCRYPT_KEY.
 // The key may be supplied as raw text, hex, or base64; we hash it to 32

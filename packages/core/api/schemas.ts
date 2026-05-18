@@ -6,7 +6,9 @@ import type {
   Attachment,
   CreateAgentFromTemplateResponse,
   LarkBindingResponse,
+  LarkUserLinkResponse,
   ListIssuesResponse,
+  StartLarkUserLinkResponse,
   TimelineEntry,
 } from "../types";
 
@@ -327,4 +329,28 @@ export const EMPTY_LARK_BINDING: LarkBindingResponse = {
   configured: false,
   enabled_events: [],
   supported_events: [],
+};
+
+// Lark user link — same defensive lenience as the workspace binding. The
+// fallback intentionally reports `configured: false` so a malformed
+// response degrades to "integration unavailable" rather than offering a
+// Connect button that will 5xx.
+export const LarkUserLinkResponseSchema = z.object({
+  linked: z.boolean(),
+  configured: z.boolean(),
+  open_id: z.string().optional(),
+  linked_at: z.string().optional(),
+}).loose();
+
+export const EMPTY_LARK_USER_LINK: LarkUserLinkResponse = {
+  linked: false,
+  configured: false,
+};
+
+export const StartLarkUserLinkResponseSchema = z.object({
+  url: z.string(),
+}).loose();
+
+export const EMPTY_START_LARK_USER_LINK: StartLarkUserLinkResponse = {
+  url: "",
 };

@@ -32,3 +32,30 @@ RETURNING *;
 
 -- name: DeleteLarkWorkspaceBinding :exec
 DELETE FROM lark_workspace_binding WHERE workspace_id = $1;
+
+-- =====================
+-- Lark user link
+-- =====================
+
+-- name: GetLarkUserLink :one
+SELECT * FROM lark_user_link
+WHERE user_id = $1;
+
+-- name: GetLarkUserLinkByOpenID :one
+SELECT * FROM lark_user_link
+WHERE lark_open_id = $1;
+
+-- name: UpsertLarkUserLink :one
+INSERT INTO lark_user_link (
+    user_id, lark_open_id, refresh_token_enc
+) VALUES (
+    $1, $2, $3
+)
+ON CONFLICT (user_id) DO UPDATE SET
+    lark_open_id      = EXCLUDED.lark_open_id,
+    refresh_token_enc = EXCLUDED.refresh_token_enc,
+    linked_at         = now()
+RETURNING *;
+
+-- name: DeleteLarkUserLink :exec
+DELETE FROM lark_user_link WHERE user_id = $1;

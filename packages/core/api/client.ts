@@ -92,6 +92,8 @@ import type {
   ListGitHubInstallationsResponse,
   GitHubConnectResponse,
   LarkBindingResponse,
+  LarkUserLinkResponse,
+  StartLarkUserLinkResponse,
   UpsertLarkBindingRequest,
   PatchLarkBindingRequest,
   Squad,
@@ -117,10 +119,14 @@ import {
   EMPTY_ATTACHMENT,
   EMPTY_CREATE_AGENT_FROM_TEMPLATE_RESPONSE,
   EMPTY_LARK_BINDING,
+  EMPTY_LARK_USER_LINK,
   EMPTY_LIST_ISSUES_RESPONSE,
+  EMPTY_START_LARK_USER_LINK,
   EMPTY_TIMELINE_ENTRIES,
   LarkBindingResponseSchema,
+  LarkUserLinkResponseSchema,
   ListIssuesResponseSchema,
+  StartLarkUserLinkResponseSchema,
   SubscribersListSchema,
   TimelineEntriesSchema,
 } from "./schemas";
@@ -1599,5 +1605,27 @@ export class ApiClient {
 
   async deleteLarkBinding(workspaceId: string): Promise<void> {
     await this.fetch(`/api/workspaces/${workspaceId}/lark/binding`, { method: "DELETE" });
+  }
+
+  // Lark (Feishu) — per-user account link (P2).
+  async getMyLarkUserLink(): Promise<LarkUserLinkResponse> {
+    const raw = await this.fetch<unknown>(`/api/users/me/lark/link`);
+    return parseWithFallback(raw, LarkUserLinkResponseSchema, EMPTY_LARK_USER_LINK, {
+      endpoint: "GET /api/users/me/lark/link",
+    });
+  }
+
+  async startLarkUserLink(returnTo?: string): Promise<StartLarkUserLinkResponse> {
+    const raw = await this.fetch<unknown>(`/api/users/me/lark/link`, {
+      method: "POST",
+      body: JSON.stringify(returnTo ? { return_to: returnTo } : {}),
+    });
+    return parseWithFallback(raw, StartLarkUserLinkResponseSchema, EMPTY_START_LARK_USER_LINK, {
+      endpoint: "POST /api/users/me/lark/link",
+    });
+  }
+
+  async deleteMyLarkUserLink(): Promise<void> {
+    await this.fetch(`/api/users/me/lark/link`, { method: "DELETE" });
   }
 }
