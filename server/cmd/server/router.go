@@ -138,6 +138,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// as "no cache, always hit DB" (existing behavior).
 	h.TaskService.EmptyClaim = service.NewEmptyClaimCache(rdb)
 
+	// Lark doc fetcher (P3.A): used by ClaimTaskByRuntime to expand Lark
+	// doc URLs from issue body/comments into plain-text content embedded in
+	// the agent prompt. Configured-check is internal — when LARK_* env is
+	// incomplete the fetcher returns nil from FetchLinkedDocsForIssue so
+	// the claim path is a no-op.
+	larkCfg := service.LarkConfigFromEnv()
+	h.LarkDocs = service.NewLarkDocs(service.NewLarkClient(larkCfg))
+
 	// Wire WS heartbeat after stores are finalized so the WS path uses the
 	// same (possibly Redis-backed) stores as the HTTP path.
 	daemonHub.SetHeartbeatHandler(h.HandleDaemonWSHeartbeat)

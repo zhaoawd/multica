@@ -61,6 +61,21 @@ type Task struct {
 	QuickCreatePrompt       string          `json:"quick_create_prompt,omitempty"`       // user's natural-language input for quick-create tasks
 	SquadID                 string          `json:"squad_id,omitempty"`                  // when the picker was a squad, the squad's UUID; Agent is still the resolved leader
 	SquadName               string          `json:"squad_name,omitempty"`                // display name for the picker squad, used in prompt text
+	LinkedDocs              []LinkedDoc     `json:"linked_docs,omitempty"`               // Lark doc URLs found in issue body/comments, expanded server-side at claim time (P3.A); mirrors handler.AgentTaskResponse.LinkedDocs
+}
+
+// LinkedDoc mirrors service.LinkedDoc on the daemon side. The server
+// expands Lark doc URLs (docx, wiki) referenced from issue body/comments
+// at claim time and ships the plain-text content here so the daemon can
+// embed it into the agent prompt without ever holding a Lark token itself.
+// Error is one of "" (success), "forbidden", "not_found", "unavailable" —
+// the prompt builder renders an explicit placeholder in the non-empty case
+// so the agent still sees the URL was acknowledged.
+type LinkedDoc struct {
+	URL     string `json:"url"`
+	Title   string `json:"title,omitempty"`
+	Content string `json:"content,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon

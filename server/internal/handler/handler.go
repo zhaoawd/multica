@@ -91,7 +91,12 @@ type Handler struct {
 	Analytics             analytics.Client
 	PATCache              *auth.PATCache
 	DaemonTokenCache      *auth.DaemonTokenCache
-	cfg                   Config
+	// LarkDocs is the Lark document content fetcher used by ClaimTaskByRuntime
+	// to expand Lark doc URLs referenced from issue body or comments into the
+	// agent prompt (P3.A). Optional — when nil or unconfigured, claim responses
+	// omit linked_docs and the dispatch path is a no-op.
+	LarkDocs *service.LarkDocs
+	cfg      Config
 }
 
 func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *events.Bus, emailService *service.EmailService, store storage.Storage, cfSigner *auth.CloudFrontSigner, analyticsClient analytics.Client, cfg Config, daemonHubs ...*daemonws.Hub) *Handler {

@@ -32,7 +32,40 @@ func BuildPrompt(task Task, provider string) string {
 	fmt.Fprintf(&b, "Your assigned issue ID is: %s\n\n", task.IssueID)
 	fmt.Fprintf(&b, "Start by running `multica issue get %s --output json` to understand your task, then complete it.\n", task.IssueID)
 	fmt.Fprintf(&b, "If you need comment history, `multica issue comment list %s --output json` returns all comments for the issue (server caps at 2000). Pass `--since <RFC3339>` to fetch only comments newer than a known cursor.\n", task.IssueID)
+	appendLinkedDocs(&b, task.LinkedDocs)
 	return b.String()
+}
+
+// appendLinkedDocs renders the LinkedDocs section into the prompt. The
+// server fetches Lark doc content at claim time (P3.A); the agent treats
+// the bodies as additional task description. Failures render as `[doc
+// unavailable: <reason>]` placeholders so the agent still acknowledges the
+// reference rather than silently skipping it.
+//
+// No-op when docs is empty so existing prompts stay byte-identical.
+func appendLinkedDocs(b *strings.Builder, docs []LinkedDoc) {
+	if len(docs) == 0 {
+		return
+	}
+	b.WriteString("\n## Linked Lark documents\n\n")
+	b.WriteString("The following Lark documents were referenced in this issue's description or comments. Treat each one's content as additional task context — the user expects you to have read them.\n\n")
+	for _, d := range docs {
+		fmt.Fprintf(b, "### %s\n\n", d.URL)
+		if d.Error != "" {
+			fmt.Fprintf(b, "_[doc unavailable: %s]_\n\n", d.Error)
+			continue
+		}
+		if d.Content == "" {
+			b.WriteString("_[doc is empty]_\n\n")
+			continue
+		}
+		b.WriteString(d.Content)
+		if !strings.HasSuffix(d.Content, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("---\n\n")
 }
 
 // buildQuickCreatePrompt constructs a prompt for quick-create tasks. The
@@ -148,6 +181,7 @@ func buildCommentPrompt(task Task, provider string) string {
 	}
 	fmt.Fprintf(&b, "Start by running `multica issue get %s --output json` to understand your task, then decide how to proceed.\n\n", task.IssueID)
 	fmt.Fprintf(&b, "If you need comment history, `multica issue comment list %s --output json` returns all comments for the issue (server caps at 2000). Pass `--since <RFC3339>` to fetch only comments newer than a known cursor.\n\n", task.IssueID)
+	appendLinkedDocs(&b, task.LinkedDocs)
 	b.WriteString(execenv.BuildCommentReplyInstructions(provider, task.IssueID, task.TriggerCommentID))
 	return b.String()
 }

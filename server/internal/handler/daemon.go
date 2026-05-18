@@ -1181,6 +1181,14 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 					resp.Repos = repos
 				}
 			}
+
+			// Lark doc expansion (P3.A): scan issue body + comments for Lark
+			// doc URLs, fetch their raw content, and surface as resp.LinkedDocs
+			// so the daemon can embed them inline in the agent prompt. Failures
+			// degrade to LinkedDoc{Error: ...} entries — never block the claim.
+			// Bounded by service.MaxDocsPerClaim with a per-fetch timeout so a
+			// slow Lark API can't pin claim latency past the worst-case budget.
+			resp.LinkedDocs = h.fetchLinkedDocsForIssue(r.Context(), issue)
 		}
 
 		// Fetch the triggering comment content so the daemon can embed it

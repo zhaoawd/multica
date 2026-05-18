@@ -200,6 +200,61 @@ func TestBuildPromptSquadLeaderNoActionForAgentTrigger(t *testing.T) {
 	}
 }
 
+// TestBuildPromptLinkedDocs_DefaultBranch verifies that Lark doc bodies
+// expanded server-side at claim time are embedded into the default issue
+// prompt. The agent must see the doc content as plain text — that is the
+// whole point of P3.A doc expansion.
+func TestBuildPromptLinkedDocs_DefaultBranch(t *testing.T) {
+	task := Task{
+		IssueID: "issue-123",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/Abc", Content: "Spec section A"},
+			{URL: "https://acme.feishu.cn/docx/Missing", Error: "not_found"},
+		},
+	}
+	out := BuildPrompt(task, "claude")
+	for _, want := range []string{
+		"## Linked Lark documents",
+		"https://acme.feishu.cn/docx/Abc",
+		"Spec section A",
+		"https://acme.feishu.cn/docx/Missing",
+		"[doc unavailable: not_found]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("default prompt missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildPromptLinkedDocs_CommentBranch verifies the same docs surface
+// on comment-triggered prompts (which take a different code path).
+func TestBuildPromptLinkedDocs_CommentBranch(t *testing.T) {
+	task := Task{
+		IssueID:               "issue-123",
+		TriggerCommentID:      "comment-456",
+		TriggerCommentContent: "Have a look",
+		TriggerAuthorType:     "member",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/Abc", Content: "Spec body"},
+		},
+	}
+	out := BuildPrompt(task, "claude")
+	if !strings.Contains(out, "## Linked Lark documents") || !strings.Contains(out, "Spec body") {
+		t.Fatalf("comment prompt missing linked-docs section:\n%s", out)
+	}
+}
+
+// TestBuildPromptLinkedDocs_EmptyIsByteIdentical verifies that tasks with
+// no linked docs produce exactly the prompt they did before the LinkedDocs
+// field existed — i.e. the wiring change must not perturb existing prompts.
+func TestBuildPromptLinkedDocs_EmptyIsByteIdentical(t *testing.T) {
+	task := Task{IssueID: "issue-123"}
+	out := BuildPrompt(task, "claude")
+	if strings.Contains(out, "Linked Lark documents") {
+		t.Fatalf("default prompt must not include linked-docs heading when LinkedDocs is empty:\n%s", out)
+	}
+}
+
 // TestBuildPromptNonSquadLeaderNoRule verifies that non-squad-leader agents
 // do NOT get the squad leader no_action rule injected.
 func TestBuildPromptNonSquadLeaderNoRule(t *testing.T) {

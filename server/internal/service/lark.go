@@ -77,13 +77,18 @@ func (c LarkConfig) Configured() bool {
 // LarkClient is a minimal Lark Open API client.
 // One instance is shared across the process; the embedded tokenCache
 // memoizes the app-level tenant_access_token until close to expiry.
+//
+// apiBase is overridable only via the test-only setter (see SetAPIBaseForTest);
+// production code always uses the const larkAPIBase. We carry it as a field
+// rather than mutating package-level state so parallel tests don't race.
 type LarkClient struct {
 	cfg        LarkConfig
 	httpClient *http.Client
+	apiBase    string
 
-	mu        sync.Mutex
-	token     string
-	tokenExp  time.Time
+	mu       sync.Mutex
+	token    string
+	tokenExp time.Time
 }
 
 // NewLarkClient constructs a client. Callers should check cfg.Configured()
@@ -93,6 +98,7 @@ func NewLarkClient(cfg LarkConfig) *LarkClient {
 	return &LarkClient{
 		cfg:        cfg,
 		httpClient: &http.Client{Timeout: larkDefaultHTTPTimeout},
+		apiBase:    larkAPIBase,
 	}
 }
 
@@ -113,7 +119,7 @@ func (c *LarkClient) tenantAccessToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, larkAPIBase+larkTokenPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiBase+larkTokenPath, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -172,7 +178,7 @@ func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, car
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, larkAPIBase+larkSendMessagePath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiBase+larkSendMessagePath, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -256,7 +262,7 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 	if err != nil {
 		return LarkOIDCResult{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, larkAPIBase+larkOIDCAccessTokenPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiBase+larkOIDCAccessTokenPath, bytes.NewReader(body))
 	if err != nil {
 		return LarkOIDCResult{}, err
 	}
