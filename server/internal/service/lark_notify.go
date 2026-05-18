@@ -166,9 +166,15 @@ func (n *LarkNotify) Configured() bool { return n.cfg.Configured() }
 // handler.IssueResponse — that would invert the handler→service import
 // direction. Listener-side code (cmd/server) projects the response into
 // this shape before calling us.
+//
+// IssueID / WorkspaceID are UUIDs (string-encoded). They feed the action
+// button payload so the webhook handler can route the click back to the
+// right issue without re-doing slug→id resolution.
 type IssueInfo struct {
-	Identifier string
-	Title      string
+	IssueID       string
+	WorkspaceID   string
+	Identifier    string
+	Title         string
 	WorkspaceSlug string
 }
 
@@ -185,9 +191,11 @@ func (n *LarkNotify) IssueURL(info IssueInfo) string {
 	return fmt.Sprintf("%s/%s/issues/%s", n.frontend, info.WorkspaceSlug, info.Identifier)
 }
 
-// NotifyIssueCreated emits an "issue created" card with a Claim button.
-// hasAssignee gates the button label: assigned issues skip the claim CTA
-// and just offer a View action.
+// NotifyIssueCreated emits an "issue created" card. For unassigned issues
+// with a known UUID we also wire a Claim action button — clicking it
+// round-trips through `POST /api/webhooks/lark` and sets the assignee to
+// the (linked) clicker. Assigned issues or issues with missing IDs
+// fall back to a plain View button.
 func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, creatorName string) {
 	n.dispatch(ctx, workspaceID, protocol.EventIssueCreated, func() any {
 		title := fmt.Sprintf("📝 New issue: %s", info.Identifier)
@@ -195,16 +203,24 @@ func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string,
 		if creatorName != "" {
 			desc = fmt.Sprintf("%s\n\n_Created by %s_", desc, creatorName)
 		}
-		actionLabel := "Claim"
-		if hasAssignee {
-			actionLabel = "View"
+		buttons := []cardButton{}
+		if !hasAssignee && info.IssueID != "" {
+			buttons = append(buttons, cardButton{
+				Text:  "Claim",
+				Type:  "primary",
+				Value: map[string]any{"verb": "claim", "issue_id": info.IssueID},
+			})
 		}
-		return buildCard(title, desc, []cardButton{{Text: actionLabel, URL: n.IssueURL(info)}})
+		buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
+		return buildCard(title, desc, buttons)
 	})
 }
 
 // NotifyIssueAssigned emits an "issue assigned" card on assignee change.
-// assigneeName is best-effort — empty string just omits the line.
+// assigneeName is best-effort — empty string just omits the line. The
+// card also carries a "Mark Done" action button so the assignee can
+// close the issue straight from Lark (the webhook resolves the clicker
+// via lark_user_link and applies the status change).
 func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string, info IssueInfo, assigneeName string) {
 	n.dispatch(ctx, workspaceID, protocol.EventIssueUpdated, func() any {
 		title := fmt.Sprintf("👤 Assigned: %s", info.Identifier)
@@ -212,7 +228,16 @@ func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string
 		if assigneeName != "" {
 			desc = fmt.Sprintf("%s\n\n_Assignee: %s_", desc, assigneeName)
 		}
-		return buildCard(title, desc, []cardButton{{Text: "View", URL: n.IssueURL(info)}})
+		buttons := []cardButton{}
+		if info.IssueID != "" {
+			buttons = append(buttons, cardButton{
+				Text:  "Mark Done",
+				Type:  "primary",
+				Value: map[string]any{"verb": "mark_done", "issue_id": info.IssueID},
+			})
+		}
+		buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
+		return buildCard(title, desc, buttons)
 	})
 }
 
@@ -339,9 +364,11 @@ func (n *LarkNotify) ResolveIssueInfoByID(ctx context.Context, issueID string) (
 	wsID := util.UUIDToString(issue.WorkspaceID)
 	ws, err := n.queries.GetWorkspace(ctx, issue.WorkspaceID)
 	if err != nil {
-		return wsID, IssueInfo{Title: issue.Title}, true
+		return wsID, IssueInfo{IssueID: issueID, WorkspaceID: wsID, Title: issue.Title}, true
 	}
 	return wsID, IssueInfo{
+		IssueID:       issueID,
+		WorkspaceID:   wsID,
 		Identifier:    fmt.Sprintf("%s-%d", ws.IssuePrefix, issue.Number),
 		Title:         issue.Title,
 		WorkspaceSlug: ws.Slug,
@@ -350,9 +377,23 @@ func (n *LarkNotify) ResolveIssueInfoByID(ctx context.Context, issueID string) (
 
 // ── Card building ────────────────────────────────────────────────────────
 
+// cardButton describes one button rendered into a Lark interactive card.
+//
+// Exactly one of URL or Value should be set:
+//   - URL produces a "navigate" button (clicking opens the link in the
+//     user's browser; no callback to multica).
+//   - Value produces an action button. Lark POSTs the map back to
+//     `POST /api/webhooks/lark` when the user clicks, where the webhook
+//     handler dispatches on the `verb` key. Used for P2 in-chat actions
+//     (claim, mark_done) that round-trip through multica.
+//
+// Type controls the Lark visual style ("primary", "default", "danger").
+// Empty => "default".
 type cardButton struct {
-	Text string
-	URL  string
+	Text  string
+	URL   string
+	Value map[string]any
+	Type  string
 }
 
 // buildCard returns a Lark interactive-card structure. Format follows
@@ -371,12 +412,26 @@ func buildCard(headerTitle, markdownBody string, buttons []cardButton) map[strin
 	if len(buttons) > 0 {
 		actions := make([]map[string]any, 0, len(buttons))
 		for _, b := range buttons {
-			actions = append(actions, map[string]any{
+			btnType := b.Type
+			if btnType == "" {
+				btnType = "default"
+			}
+			btn := map[string]any{
 				"tag":  "button",
 				"text": map[string]any{"tag": "plain_text", "content": b.Text},
-				"url":  b.URL,
-				"type": "default",
-			})
+				"type": btnType,
+			}
+			// Action buttons take precedence — when a verb is wired up,
+			// stripping the URL avoids Lark opening a new tab on top of
+			// the callback. Both fields could theoretically coexist on
+			// the Lark side, but the UX of "two things happen at once"
+			// is worse than picking one.
+			if b.Value != nil {
+				btn["value"] = b.Value
+			} else if b.URL != "" {
+				btn["url"] = b.URL
+			}
+			actions = append(actions, btn)
 		}
 		elements = append(elements, map[string]any{
 			"tag":     "action",

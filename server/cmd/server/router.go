@@ -223,6 +223,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// initiating user_id, signed with LARK_VERIFICATION_TOKEN).
 	r.Get("/api/lark/oauth/callback", h.LarkUserOAuthCallback)
 
+	// Lark interactive-card webhook (no Multica auth — payload signature
+	// verified against LARK_ENCRYPT_KEY / LARK_VERIFICATION_TOKEN inside
+	// the handler).
+	r.Post("/api/webhooks/lark", h.HandleLarkWebhook)
+
 	// Daemon API routes (require daemon token or valid user token)
 	r.Route("/api/daemon", func(r chi.Router) {
 		r.Use(middleware.DaemonAuth(queries, patCache, daemonTokenCache))

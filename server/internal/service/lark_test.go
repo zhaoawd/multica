@@ -102,6 +102,40 @@ func TestBuildCard_ShapeStaysStable(t *testing.T) {
 	}
 }
 
+func TestBuildCard_ActionButtonEmitsValueNotURL(t *testing.T) {
+	card := buildCard("Header", "Body", []cardButton{
+		{Text: "Claim", Value: map[string]any{"verb": "claim", "issue_id": "uuid-1"}, Type: "primary"},
+		{Text: "View", URL: "https://example.test/x"},
+	})
+	js := CardJSON(card)
+
+	// Action button: value present, type=primary, no url field.
+	if !strings.Contains(js, `"value":{"issue_id":"uuid-1","verb":"claim"}`) &&
+		!strings.Contains(js, `"value":{"verb":"claim","issue_id":"uuid-1"}`) {
+		t.Fatalf("expected action button value in JSON; got: %s", js)
+	}
+	if !strings.Contains(js, `"type":"primary"`) {
+		t.Fatalf("expected primary type for claim button; got: %s", js)
+	}
+	// URL button still works alongside.
+	if !strings.Contains(js, `"https://example.test/x"`) {
+		t.Fatalf("expected URL button to coexist; got: %s", js)
+	}
+
+	// Parse and confirm the action button has no `url` key.
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(js), &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	elements := parsed["elements"].([]any)
+	actionBlock := elements[1].(map[string]any)
+	actions := actionBlock["actions"].([]any)
+	claimBtn := actions[0].(map[string]any)
+	if _, ok := claimBtn["url"]; ok {
+		t.Fatalf("action button should not carry url field; got %v", claimBtn)
+	}
+}
+
 func TestBuildCard_NoButtonsOmitsActionElement(t *testing.T) {
 	card := buildCard("Header", "Body", nil)
 	js := CardJSON(card)

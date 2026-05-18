@@ -148,6 +148,8 @@ func larkIssueInfo(ctx context.Context, notify *service.LarkNotify, queries *db.
 		}
 	}
 	return service.IssueInfo{
+		IssueID:       issue.ID,
+		WorkspaceID:   issue.WorkspaceID,
 		Identifier:    identifier,
 		Title:         issue.Title,
 		WorkspaceSlug: slug,
