@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/service"
 )
 
 // withLarkWebhookEnv flips on the env vars the webhook handler reads.
@@ -35,6 +36,19 @@ func signLarkBody(ts, nonce, encryptKey string, body []byte) string {
 	h.Write([]byte(encryptKey))
 	h.Write(body)
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// signLarkRequest attaches a valid X-Lark-Signature triple to req using
+// the test encrypt key. Lark v2 event subscriptions don't carry a flat
+// `token` field that the body-fallback path can match against, so any
+// test that POSTs a v2 envelope must sign the request.
+func signLarkRequest(req *http.Request, body []byte) {
+	const ts = "1700000000"
+	const nonce = "n_test"
+	sig := signLarkBody(ts, nonce, "encrypt_test_key", body)
+	req.Header.Set("X-Lark-Signature", sig)
+	req.Header.Set("X-Lark-Request-Timestamp", ts)
+	req.Header.Set("X-Lark-Request-Nonce", nonce)
 }
 
 func TestLarkWebhook_URLVerificationChallengeEchoesBackViaTokenFallback(t *testing.T) {
@@ -175,6 +189,7 @@ func TestLarkWebhook_UnlinkedClickerGetsLinkPrompt(t *testing.T) {
 		},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
 	rr := httptest.NewRecorder()
 	testHandler.HandleLarkWebhook(rr, req)
 	if rr.Code != http.StatusOK {
@@ -297,3 +312,249 @@ func TestLarkWebhook_MarkDoneVerb_FlipsStatus(t *testing.T) {
 		t.Fatalf("status = %q, want done", status)
 	}
 }
+
+// ── P4: @bot message-event dispatch ─────────────────────────────────────
+
+// installFakeLarkThreadService points testHandler.LarkThread at a Lark
+// API stub so reply calls (ReplyToMessage / ListThreadMessages) hit a
+// local httptest server instead of the real open.feishu.cn endpoint.
+// The stub always returns success (code=0). Returns a teardown that
+// restores the original wiring; callers register it via t.Cleanup.
+func installFakeLarkThreadService(t *testing.T) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tenant_access_token"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "tenant_access_token": "tk", "expire": 7200,
+			})
+		case strings.Contains(r.URL.Path, "/im/v1/messages") && r.Method == http.MethodGet:
+			// Empty thread list — no transcript to surface in issue body.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "data": map[string]any{"items": []any{}},
+			})
+		case strings.Contains(r.URL.Path, "/reply"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0})
+		}
+	}))
+	cfg := service.LarkConfig{AppID: "a", AppSecret: "b", VerificationToken: "verify_test_token", EncryptKey: "encrypt_test_key"}
+	client := service.NewLarkClient(cfg)
+	service.SetAPIBaseForTest(client, srv.URL)
+
+	prev := testHandler.LarkThread
+	testHandler.LarkThread = service.NewLarkThreadService(testHandler.Queries, testPool, testHandler.Bus, client)
+	t.Cleanup(func() {
+		testHandler.LarkThread = prev
+		srv.Close()
+	})
+}
+
+// seedLarkChatBinding inserts a lark_workspace_binding for the test
+// workspace + given chat_id, registers a cleanup to roll it back.
+func seedLarkChatBinding(t *testing.T, chatID string) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_workspace_binding (workspace_id, chat_id) VALUES ($1, $2)
+		 ON CONFLICT (workspace_id) DO UPDATE SET chat_id = EXCLUDED.chat_id`,
+		testWorkspaceID, chatID); err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM lark_workspace_binding WHERE workspace_id = $1`, testWorkspaceID)
+	})
+}
+
+// buildLarkV2MessageEvent wraps a message into Lark's v2 event
+// subscription envelope. Only the fields the dispatcher reads are
+// populated — everything else stays defaulted.
+func buildLarkV2MessageEvent(senderOpenID, chatID, threadID, messageID, text string) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"schema": "2.0",
+		"header": map[string]any{
+			"event_type": "im.message.receive_v1",
+			"token":      "verify_test_token",
+		},
+		"event": map[string]any{
+			"sender": map[string]any{
+				"sender_type": "user",
+				"sender_id":   map[string]any{"open_id": senderOpenID},
+			},
+			"message": map[string]any{
+				"message_id":   messageID,
+				"chat_id":      chatID,
+				"thread_id":    threadID,
+				"message_type": "text",
+				"content":      `{"text":"` + text + `"}`,
+				"create_time":  "1747555200000",
+			},
+		},
+	})
+	return body
+}
+
+func TestLarkWebhook_CreateIssueVerb_CreatesIssueAndLinkRow(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	const openID = "ou_create_issue_happy_path"
+	const chatID = "oc_p4_create_happy"
+	const triggerMsgID = "om_trigger_create_happy"
+	seedLarkChatBinding(t, chatID)
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_user_link (user_id, lark_open_id) VALUES ($1, $2)`,
+		testUserID, openID); err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	body := buildLarkV2MessageEvent(openID, chatID, "", triggerMsgID,
+		"@_user_1 创建任务 fix the flaky CI on Tuesdays")
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
+	rr := httptest.NewRecorder()
+	testHandler.HandleLarkWebhook(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+
+	// Verify: issue was created with the resolved title, and the
+	// lark_issue_link row points back at the trigger message id (we
+	// passed no thread_id, so the anchor IS the trigger message).
+	var issueID string
+	var title string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT id, title FROM issue
+		 WHERE workspace_id = $1 AND creator_id::text = $2
+		 ORDER BY created_at DESC LIMIT 1`,
+		testWorkspaceID, testUserID).Scan(&issueID, &title); err != nil {
+		t.Fatalf("read back issue: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+	if title != "fix the flaky CI on Tuesdays" {
+		t.Fatalf("title = %q", title)
+	}
+
+	var linkChatID, linkRoot string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT chat_id, root_message_id FROM lark_issue_link WHERE issue_id = $1`,
+		issueID).Scan(&linkChatID, &linkRoot); err != nil {
+		t.Fatalf("read back link: %v", err)
+	}
+	if linkChatID != chatID {
+		t.Fatalf("link.chat_id = %q, want %q", linkChatID, chatID)
+	}
+	if linkRoot != triggerMsgID {
+		t.Fatalf("link.root_message_id = %q, want %q", linkRoot, triggerMsgID)
+	}
+}
+
+func TestLarkWebhook_CreateIssueVerb_UnlinkedUserGetsBindHint(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	const chatID = "oc_p4_unlinked"
+	seedLarkChatBinding(t, chatID)
+
+	body := buildLarkV2MessageEvent("ou_someone_not_linked", chatID, "", "om_trigger",
+		"@_user_1 创建任务 do the thing")
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
+	rr := httptest.NewRecorder()
+	testHandler.HandleLarkWebhook(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	// No issue should have been created — the dispatcher short-circuits
+	// before CreateIssueFromThread when the sender isn't linked.
+	var count int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM issue WHERE workspace_id = $1 AND title = $2`,
+		testWorkspaceID, "do the thing").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no issue created, got %d", count)
+	}
+}
+
+func TestLarkWebhook_UnknownVerb_SilentAck(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	const chatID = "oc_p4_unknown_verb"
+	seedLarkChatBinding(t, chatID)
+	const openID = "ou_unknown_verb_user"
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_user_link (user_id, lark_open_id) VALUES ($1, $2)`,
+		testUserID, openID); err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	body := buildLarkV2MessageEvent(openID, chatID, "", "om_irrelevant",
+		"@_user_1 just chatting, no verb here")
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
+	rr := httptest.NewRecorder()
+	testHandler.HandleLarkWebhook(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	// No issue, no link — the dispatcher returned early on
+	// ParseLarkBotVerb == LarkVerbNone.
+	var count int
+	testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM lark_issue_link l
+		 JOIN issue i ON i.id = l.issue_id
+		 WHERE i.workspace_id = $1 AND l.chat_id = $2`,
+		testWorkspaceID, chatID).Scan(&count)
+	if count != 0 {
+		t.Fatalf("expected no link row, got %d", count)
+	}
+}
+
+func TestLarkWebhook_UnboundChat_SilentAck(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	// No binding inserted — bot is in a chat that isn't bound to any
+	// workspace. The dispatcher must silently drop rather than guess
+	// which workspace the issue belongs to.
+	body := buildLarkV2MessageEvent("ou_anyone", "oc_p4_unbound_chat", "", "om_a",
+		"@_user_1 创建任务 should be ignored")
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
+	rr := httptest.NewRecorder()
+	testHandler.HandleLarkWebhook(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+
+	var count int
+	testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM issue WHERE title = $1`, "should be ignored").Scan(&count)
+	if count != 0 {
+		t.Fatalf("issue created for unbound chat (count=%d)", count)
+	}
+}
+
+// silence linter — pgtype is imported by the file via earlier tests.
+var _ = pgtype.Text{}

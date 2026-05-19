@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -61,6 +63,16 @@ type LarkCardCallback struct {
 // HandleLarkWebhook routes the request to the right inner handler. Always
 // returns 200 + JSON so Lark doesn't retry; security failures come back
 // as 401 *before* any business logic runs.
+//
+// Three envelope shapes coexist on this endpoint:
+//
+//	v1 url_verification    — flat {"type":"url_verification","challenge":"..."}
+//	v1 card action         — {"action":{"tag":"button",...}}
+//	v2 event subscription  — {"schema":"2.0","header":{"event_type":"..."},"event":{...}}
+//
+// We sniff a minimal envelope first to pick the branch, then unmarshal
+// the full payload only inside the branch that consumes it. The v2
+// im.message.receive_v1 event is where the P4 @bot dispatcher lives.
 func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -73,19 +85,45 @@ func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Minimal sniff. Keep it tolerant — Lark's v1 and v2 envelopes both
+	// have `Type` at the top level under certain configurations, so the
+	// branch order below matters.
+	var envelope struct {
+		Schema    string `json:"schema"`
+		Type      string `json:"type"`
+		Challenge string `json:"challenge"`
+		Header    struct {
+			EventType string `json:"event_type"`
+		} `json:"header"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+
+	// v1 URL verification handshake (Lark posts once at endpoint setup).
+	if envelope.Type == "url_verification" {
+		writeJSON(w, http.StatusOK, map[string]string{"challenge": envelope.Challenge})
+		return
+	}
+
+	// v2 event subscription — currently we only dispatch on message
+	// receive (P4 @bot verbs). Other v2 events are silently ack'd.
+	if envelope.Schema == "2.0" {
+		if envelope.Header.EventType == "im.message.receive_v1" {
+			h.handleLarkMessageEvent(r.Context(), w, body)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+
+	// v1 interactive-card callback (existing P2.2 path).
 	var payload LarkCardCallback
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid payload")
 		return
 	}
-
-	// URL verification handshake — Lark sends this once at setup.
-	if payload.Type == "url_verification" {
-		writeJSON(w, http.StatusOK, map[string]string{"challenge": payload.Challenge})
-		return
-	}
-
-	// Action callback — only "button" tag is wired in P2.2.
 	if payload.Action.Tag != "button" {
 		// Other tags (select_static, picker, ...) may come from cards we
 		// haven't built. Acknowledge silently so Lark doesn't retry.
@@ -283,4 +321,230 @@ func (h *Handler) larkMarkIssueDone(ctx context.Context, w http.ResponseWriter, 
 		"source":         "lark_card_action",
 	})
 	writeJSON(w, http.StatusOK, toastResponse("success", "Marked done"))
+}
+
+// ── P4: message receive event dispatch ─────────────────────────────────
+
+// larkMessageEvent is the subset of Lark's im.message.receive_v1 payload
+// the @bot dispatcher consumes. Lark sends much more (event_id,
+// tenant_key, encrypt-mode metadata, message i18n hints, ...) but P4
+// only needs the sender identity, message id triple, and content.
+//
+// Mentions is the array Lark fills with the entities @-tagged in the
+// message. We don't filter on which entry is "our bot" — Lark's event
+// subscription scope `im.message.receive_v1` only delivers messages
+// where the bot is already a meaningful participant (direct messages
+// and group messages that @-mention the bot or hit a configured
+// keyword), so any inbound payload counts as a bot-addressed message
+// by construction.
+type larkMessageEvent struct {
+	Schema string `json:"schema"`
+	Event  struct {
+		Sender struct {
+			SenderType string `json:"sender_type"`
+			SenderID   struct {
+				OpenID  string `json:"open_id"`
+				UnionID string `json:"union_id"`
+			} `json:"sender_id"`
+		} `json:"sender"`
+		Message struct {
+			MessageID  string `json:"message_id"`
+			RootID     string `json:"root_id"`
+			ParentID   string `json:"parent_id"`
+			ThreadID   string `json:"thread_id"`
+			ChatID     string `json:"chat_id"`
+			ChatType   string `json:"chat_type"`
+			MsgType    string `json:"message_type"`
+			Content    string `json:"content"`
+			CreateTime string `json:"create_time"`
+		} `json:"message"`
+	} `json:"event"`
+}
+
+// handleLarkMessageEvent routes a Lark message event to the right verb
+// handler. The response body is always an empty object — Lark v2 events
+// don't use the response payload, and a non-200 would just trigger a
+// retry storm. Errors surface back to the user as Lark thread replies
+// (see replyToLarkMessage), never as HTTP errors.
+func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWriter, body []byte) {
+	defer writeJSON(w, http.StatusOK, map[string]any{})
+
+	if h.LarkThread == nil || !h.LarkThread.Configured() {
+		slog.Info("lark @bot: integration unconfigured, skipping message event")
+		return
+	}
+
+	var evt larkMessageEvent
+	if err := json.Unmarshal(body, &evt); err != nil {
+		slog.Warn("lark @bot: unmarshal event failed", "err", err)
+		return
+	}
+	msg := evt.Event.Message
+	if msg.MessageID == "" || msg.ChatID == "" {
+		return
+	}
+
+	// Only handle text messages from human users. Bot-to-bot and
+	// non-text payloads (image, file, sticker) are silently dropped —
+	// they can't carry a structured verb and treating them as @bot
+	// invocations would just produce spurious replies.
+	if evt.Event.Sender.SenderType != "user" || msg.MsgType != "text" {
+		return
+	}
+
+	rawText := extractLarkTextContent(msg.Content)
+	if rawText == "" {
+		return
+	}
+	cleaned := service.StripLarkMentionPlaceholders(rawText)
+	verb, remainder := service.ParseLarkBotVerb(cleaned)
+	if verb == service.LarkVerbNone {
+		// No recognised verb — silently ignore per the design's
+		// no-NLU rule (§6.5: "avoid misfires").
+		return
+	}
+
+	// Map chat → workspace. The chat must be bound via the
+	// settings UI for the bot to act in it; an unbound chat with the
+	// bot mistakenly added would otherwise let any user create
+	// issues in an arbitrary workspace.
+	binding, err := h.Queries.GetLarkWorkspaceBindingByChatID(ctx, msg.ChatID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			slog.Info("lark @bot: chat not bound to any workspace", "chat_id", msg.ChatID)
+			return
+		}
+		slog.Warn("lark @bot: workspace binding lookup", "err", err, "chat_id", msg.ChatID)
+		return
+	}
+
+	// Map sender → user. Unlinked users get a one-time hint reply so
+	// they can bind from the multica UI; we don't proceed because we
+	// have no creator identity to record on the issue.
+	if evt.Event.Sender.SenderID.OpenID == "" {
+		return
+	}
+	link, err := h.Queries.GetLarkUserLinkByOpenID(ctx, evt.Event.Sender.SenderID.OpenID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			h.replyToLarkMessage(ctx, msg.MessageID,
+				"在 Multica → Settings → Profile 绑定飞书账号后即可使用 @bot 指令。")
+			return
+		}
+		slog.Warn("lark @bot: user link lookup", "err", err)
+		return
+	}
+
+	// Workspace membership gate. The user link is global (one open_id ↔
+	// one multica user), but each verb runs in the context of the chat's
+	// bound workspace — so we must re-verify the user belongs to it.
+	if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+		UserID:      link.UserID,
+		WorkspaceID: binding.WorkspaceID,
+	}); err != nil {
+		h.replyToLarkMessage(ctx, msg.MessageID, "你不是该 workspace 的成员，无法执行此指令。")
+		return
+	}
+
+	switch verb {
+	case service.LarkVerbCreateIssue:
+		h.handleLarkCreateIssue(ctx, msg, link.UserID, binding.WorkspaceID, remainder)
+	case service.LarkVerbLinkDoc, service.LarkVerbOpenMeeting:
+		// Reserved verbs — recognise them so the user knows they were
+		// understood, but reply explicitly that the implementation is
+		// pending rather than silently dropping (which would look like
+		// the bot ignored them).
+		h.replyToLarkMessage(ctx, msg.MessageID, "该指令暂未实装，敬请期待。")
+	}
+}
+
+// handleLarkCreateIssue runs the @bot 创建任务 verb end-to-end:
+// fetch thread context (best effort), insert the issue + link row in a
+// single transaction, and reply into the originating Lark thread with
+// the new issue identifier.
+//
+// On failure we reply with a short error string. The reply itself is
+// also best-effort — if Lark is down, the issue still exists in
+// multica and the user can navigate to it from the web UI.
+func (h *Handler) handleLarkCreateIssue(ctx context.Context, msg larkInboundMessage, creator pgtype.UUID, workspaceID pgtype.UUID, body string) {
+	// Choose the bridge anchor. Prefer thread_id (a real Lark "thread"),
+	// then root_id (a reply to a non-threaded message — still useful for
+	// inbound bridging), then the trigger message itself. Pulling the
+	// thread transcript only makes sense when thread_id is set; for
+	// root_id we still record the anchor but skip the list call.
+	threadID := msg.ThreadID
+	if threadID == "" && msg.RootID != "" {
+		// Reply-to-message anchor — we keep the link pointing at the
+		// root so future replies still bridge correctly, but don't
+		// burn an API call trying to list a non-thread container.
+		threadID = ""
+	}
+
+	tc := h.LarkThread.FetchThreadContext(ctx, msg.ChatID, msg.MessageID, threadID, body)
+	if msg.RootID != "" && tc.ThreadID == "" {
+		// Anchor the bridge on the conversation root the user replied
+		// to, even though we didn't fetch a transcript.
+		tc.RootMessageID = msg.RootID
+	}
+
+	issue, err := h.LarkThread.CreateIssueFromThread(ctx, workspaceID, creator, tc)
+	if err != nil {
+		slog.Warn("lark @bot: create issue failed",
+			"err", err,
+			"chat_id", msg.ChatID,
+			"workspace_id", uuidToString(workspaceID),
+		)
+		h.replyToLarkMessage(ctx, msg.MessageID, "创建 issue 失败，请稍后再试。")
+		return
+	}
+
+	prefix := h.getIssuePrefix(ctx, workspaceID)
+	identifier := fmt.Sprintf("%s-%d", prefix, issue.Number)
+	h.LarkThread.ReplyWithIssueCreated(ctx, tc, identifier, issue.Title)
+}
+
+// larkInboundMessage is the projected subset of larkMessageEvent.Event.Message
+// that handleLarkCreateIssue (and any future verb handler) accepts. Defined
+// here rather than reusing the anonymous struct field type so the helper
+// is reusable from tests without rebuilding the full envelope.
+type larkInboundMessage = struct {
+	MessageID  string `json:"message_id"`
+	RootID     string `json:"root_id"`
+	ParentID   string `json:"parent_id"`
+	ThreadID   string `json:"thread_id"`
+	ChatID     string `json:"chat_id"`
+	ChatType   string `json:"chat_type"`
+	MsgType    string `json:"message_type"`
+	Content    string `json:"content"`
+	CreateTime string `json:"create_time"`
+}
+
+// extractLarkTextContent unwraps Lark's text-message content envelope
+// (`{"text":"..."}`) into a plain string. Returns "" for non-text or
+// malformed payloads — callers treat that as "nothing to dispatch on".
+func extractLarkTextContent(content string) string {
+	if content == "" {
+		return ""
+	}
+	var inner struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(content), &inner); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(inner.Text)
+}
+
+// replyToLarkMessage posts a plain-text reply, swallowing the error. The
+// caller already decided to send a message in response to a user
+// action; if the reply fails we log and move on rather than retrying
+// (Lark deduplicates by message_id + reply chain, so a retry could
+// produce a duplicate reply).
+func (h *Handler) replyToLarkMessage(ctx context.Context, messageID, text string) {
+	if h.LarkThread == nil || h.LarkThread.Client == nil || messageID == "" {
+		return
+	}
+	if err := h.LarkThread.Client.ReplyToMessage(ctx, messageID, text); err != nil {
+		slog.Warn("lark @bot: reply failed", "err", err, "message_id", messageID)
+	}
 }

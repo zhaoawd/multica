@@ -118,7 +118,11 @@ type Handler struct {
 	// agent prompt (P3.A). Optional — when nil or unconfigured, claim responses
 	// omit linked_docs and the dispatch path is a no-op.
 	LarkDocs *service.LarkDocs
-	cfg      Config
+	// LarkThread bridges Lark threads → multica issues (P4). The @bot
+	// 创建任务 verb routes through this service. Nil-safe — when unset,
+	// the webhook silently acknowledges message events without dispatching.
+	LarkThread *service.LarkThreadService
+	cfg        Config
 }
 
 func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *events.Bus, emailService *service.EmailService, store storage.Storage, cfSigner *auth.CloudFrontSigner, analyticsClient analytics.Client, cfg Config, daemonHubs ...*daemonws.Hub) *Handler {

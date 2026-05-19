@@ -178,7 +178,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// incomplete the fetcher returns nil from FetchLinkedDocsForIssue so
 	// the claim path is a no-op.
 	larkCfg := service.LarkConfigFromEnv()
-	h.LarkDocs = service.NewLarkDocs(service.NewLarkClient(larkCfg))
+	larkClient := service.NewLarkClient(larkCfg)
+	h.LarkDocs = service.NewLarkDocs(larkClient)
+	// Lark thread → issue bridge (P4). Shares the LarkClient so the
+	// tenant_access_token cache is single-flight across docs + thread
+	// fetch + reply paths. Safe to construct even when Lark is
+	// unconfigured — the service short-circuits to "unavailable".
+	h.LarkThread = service.NewLarkThreadService(queries, pool, bus, larkClient)
 
 	// Wire WS heartbeat after stores are finalized so the WS path uses the
 	// same (possibly Redis-backed) stores as the HTTP path.
