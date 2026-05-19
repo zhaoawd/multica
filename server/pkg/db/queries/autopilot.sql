@@ -169,6 +169,23 @@ WHERE autopilot_id = $1
 ORDER BY created_at DESC
 LIMIT $2 OFFSET $3;
 
+-- name: ListAutopilotRunUsages :many
+-- Per-run token totals for an autopilot, summed across (provider, model)
+-- since a single task may use multiple models in a multi-step workflow.
+-- Returns one row per autopilot_run that has a task_id with at least one
+-- task_usage record; runs without a task_id (issue_only mode, skipped,
+-- never-dispatched) are absent and the handler treats them as zero.
+SELECT
+    r.id::uuid                          AS run_id,
+    SUM(tu.input_tokens)::bigint        AS input_tokens,
+    SUM(tu.output_tokens)::bigint       AS output_tokens,
+    SUM(tu.cache_read_tokens)::bigint   AS cache_read_tokens,
+    SUM(tu.cache_write_tokens)::bigint  AS cache_write_tokens
+FROM autopilot_run r
+JOIN task_usage tu ON tu.task_id = r.task_id
+WHERE r.autopilot_id = $1
+GROUP BY r.id;
+
 -- name: UpdateAutopilotRunIssueCreated :one
 UPDATE autopilot_run
 SET status = 'issue_created', issue_id = $2

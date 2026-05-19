@@ -70,6 +70,14 @@ export interface AutopilotRun {
   trigger_payload: unknown;
   result: unknown;
   created_at: string;
+  // Token totals from task_usage. Populated by the list endpoint via a
+  // side-fetch + merge; left as 0 by detail/trigger endpoints. UI hides
+  // the token chip when all four are 0 (no usage reported yet, or this
+  // run never dispatched a task).
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
 }
 
 export interface CreateAutopilotRequest {

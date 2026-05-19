@@ -57,6 +57,7 @@ import { TranscriptButton } from "../../common/task-transcript";
 import { AutopilotDialog } from "./autopilot-dialog";
 import { WebhookPayloadPreview } from "./webhook-payload-preview";
 import { WebhookDeliveriesSection } from "./webhook-deliveries-section";
+import { formatTokens } from "../../runtimes/utils";
 import { useT } from "../../i18n";
 
 function formatDate(date: string): string {
@@ -106,6 +107,38 @@ function RunRow({ run, agentId, agentName }: { run: AutopilotRun; agentId: strin
   const visual = RUN_VISUAL[status];
   const StatusIcon = visual.icon;
 
+  // Token usage chip. Backend joins task_usage; older servers omit these
+  // fields, so optional-chain everything and default to 0. We show the
+  // chip only when at least one count is non-zero — runs that never
+  // dispatched (skipped, issue_created) stay clean.
+  const inputTokens = run.input_tokens ?? 0;
+  const outputTokens = run.output_tokens ?? 0;
+  const cacheReadTokens = run.cache_read_tokens ?? 0;
+  const cacheWriteTokens = run.cache_write_tokens ?? 0;
+  const hasTokens =
+    inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheWriteTokens > 0;
+  const cacheTokensTotal = cacheReadTokens + cacheWriteTokens;
+  const tokenSummary = !hasTokens
+    ? null
+    : cacheTokensTotal > 0
+      ? t(($) => $.run.tokens.summary_with_cache, {
+          input: formatTokens(inputTokens),
+          output: formatTokens(outputTokens),
+          cache: formatTokens(cacheTokensTotal),
+        })
+      : t(($) => $.run.tokens.summary, {
+          input: formatTokens(inputTokens),
+          output: formatTokens(outputTokens),
+        });
+  const tokenTooltip = hasTokens
+    ? t(($) => $.run.tokens.tooltip, {
+        input: formatTokens(inputTokens),
+        output: formatTokens(outputTokens),
+        cache_read: formatTokens(cacheReadTokens),
+        cache_write: formatTokens(cacheWriteTokens),
+      })
+    : undefined;
+
   // For runs with a task_id (run_only mode), build a minimal AgentTask so
   // TranscriptButton can lazy-load the execution transcript.
   const syntheticTask: AgentTask | null = run.task_id
@@ -139,10 +172,12 @@ function RunRow({ run, agentId, agentName }: { run: AutopilotRun; agentId: strin
         {t(($) => $.run_source[run.source as "schedule" | "manual" | "webhook" | "api"]) ?? run.source}
       </span>
       <span className="flex-1 min-w-0 text-xs text-muted-foreground truncate">
-        {run.issue_id ? (
-          t(($) => $.run.issue_linked)
-        ) : run.failure_reason ? (
+        {run.failure_reason ? (
           <span className="text-destructive">{run.failure_reason}</span>
+        ) : tokenSummary ? (
+          <span className="tabular-nums" title={tokenTooltip}>{tokenSummary}</span>
+        ) : run.issue_id ? (
+          t(($) => $.run.issue_linked)
         ) : null}
       </span>
       <span className="w-32 shrink-0 text-right text-xs text-muted-foreground tabular-nums">

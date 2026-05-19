@@ -543,6 +543,58 @@ func (q *Queries) GetWebhookTriggerByToken(ctx context.Context, webhookToken pgt
 	return i, err
 }
 
+const listAutopilotRunUsages = `-- name: ListAutopilotRunUsages :many
+SELECT
+    r.id::uuid                          AS run_id,
+    SUM(tu.input_tokens)::bigint        AS input_tokens,
+    SUM(tu.output_tokens)::bigint       AS output_tokens,
+    SUM(tu.cache_read_tokens)::bigint   AS cache_read_tokens,
+    SUM(tu.cache_write_tokens)::bigint  AS cache_write_tokens
+FROM autopilot_run r
+JOIN task_usage tu ON tu.task_id = r.task_id
+WHERE r.autopilot_id = $1
+GROUP BY r.id
+`
+
+type ListAutopilotRunUsagesRow struct {
+	RunID            pgtype.UUID `json:"run_id"`
+	InputTokens      int64       `json:"input_tokens"`
+	OutputTokens     int64       `json:"output_tokens"`
+	CacheReadTokens  int64       `json:"cache_read_tokens"`
+	CacheWriteTokens int64       `json:"cache_write_tokens"`
+}
+
+// Per-run token totals for an autopilot, summed across (provider, model)
+// since a single task may use multiple models in a multi-step workflow.
+// Returns one row per autopilot_run that has a task_id with at least one
+// task_usage record; runs without a task_id (issue_only mode, skipped,
+// never-dispatched) are absent and the handler treats them as zero.
+func (q *Queries) ListAutopilotRunUsages(ctx context.Context, autopilotID pgtype.UUID) ([]ListAutopilotRunUsagesRow, error) {
+	rows, err := q.db.Query(ctx, listAutopilotRunUsages, autopilotID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAutopilotRunUsagesRow{}
+	for rows.Next() {
+		var i ListAutopilotRunUsagesRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.CacheReadTokens,
+			&i.CacheWriteTokens,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAutopilotRuns = `-- name: ListAutopilotRuns :many
 SELECT id, autopilot_id, trigger_id, source, status, issue_id, task_id, triggered_at, completed_at, failure_reason, trigger_payload, result, created_at FROM autopilot_run
 WHERE autopilot_id = $1

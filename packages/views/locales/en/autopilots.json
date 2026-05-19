@@ -107,6 +107,11 @@
     "skipped_group": {
       "label": "Skipped",
       "summary": "{{count}} skipped runs"
+    },
+    "tokens": {
+      "summary": "{{input}} in · {{output}} out",
+      "summary_with_cache": "{{input}} in · {{output}} out · {{cache}} cache",
+      "tooltip": "Input {{input}} · Output {{output}} · Cache read {{cache_read}} · Cache write {{cache_write}}"
     }
   },
   "webhook_payload": {

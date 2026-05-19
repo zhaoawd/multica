@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -89,6 +90,14 @@ type AutopilotRunResponse struct {
 	TriggerPayload any     `json:"trigger_payload"`
 	Result         any     `json:"result"`
 	CreatedAt      string  `json:"created_at"`
+	// Token totals from task_usage. Populated by the list endpoint via
+	// ListAutopilotRunUsages; left zero by detail/trigger endpoints, which
+	// don't currently render usage. Frontend treats zero-all as "no usage
+	// reported yet" and hides the chip.
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
 }
 
 // ── Converters ──────────────────────────────────────────────────────────────
@@ -1014,6 +1023,19 @@ func (h *Handler) ListAutopilotRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch per-run token totals so the UI can surface "how much did this
+	// run cost?" inline with each row. Failure here is non-fatal — drop to
+	// zero tokens and keep serving the run list rather than blanking the
+	// page over a usage-summary glitch.
+	usageByRun := map[string]db.ListAutopilotRunUsagesRow{}
+	if usages, usageErr := h.Queries.ListAutopilotRunUsages(r.Context(), autopilot.ID); usageErr == nil {
+		for _, u := range usages {
+			usageByRun[uuidToString(u.RunID)] = u
+		}
+	} else {
+		slog.Warn("ListAutopilotRunUsages failed", "error", usageErr, "autopilot_id", uuidToString(autopilot.ID))
+	}
+
 	resp := make([]AutopilotRunResponse, len(runs))
 	for i, run := range runs {
 		// Omit trigger_payload in the list response — a webhook envelope
@@ -1021,6 +1043,12 @@ func (h *Handler) ListAutopilotRuns(w http.ResponseWriter, r *http.Request) {
 		// list would be a ~5 MB worst case. Detail dialog fetches the
 		// full payload from GetAutopilotRun.
 		resp[i] = runToResponseSlim(run)
+		if u, ok := usageByRun[uuidToString(run.ID)]; ok {
+			resp[i].InputTokens = u.InputTokens
+			resp[i].OutputTokens = u.OutputTokens
+			resp[i].CacheReadTokens = u.CacheReadTokens
+			resp[i].CacheWriteTokens = u.CacheWriteTokens
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": resp, "total": len(resp)})
 }

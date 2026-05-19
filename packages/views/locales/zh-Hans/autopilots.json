@@ -107,6 +107,11 @@
     "skipped_group": {
       "label": "已跳过",
       "summary": "{{count}} 条跳过的运行"
+    },
+    "tokens": {
+      "summary": "输入 {{input}} · 输出 {{output}}",
+      "summary_with_cache": "输入 {{input}} · 输出 {{output}} · 缓存 {{cache}}",
+      "tooltip": "输入 {{input}} · 输出 {{output}} · 缓存读取 {{cache_read}} · 缓存写入 {{cache_write}}"
     }
   },
   "webhook_payload": {
