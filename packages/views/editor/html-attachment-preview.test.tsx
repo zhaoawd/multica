@@ -23,7 +23,6 @@ vi.mock("../i18n", () => ({
           preview_loading: "Loading preview…",
           preview_failed: "Couldn't load preview",
         },
-        code_block: { copy_code: "Copy code" },
       }),
   }),
 }));
@@ -125,18 +124,10 @@ describe("HtmlAttachmentPreview — toolbar actions", () => {
     expect(onDownload).toHaveBeenCalled();
   });
 
-  it("writes the loaded text to the clipboard when Copy code is clicked", async () => {
+  it("does not render a Copy code button — attachments are files, not source snippets", async () => {
     getAttachmentTextContentMock.mockResolvedValueOnce({
-      text: "<p>chart source</p>",
+      text: "<p>ok</p>",
       originalContentType: "text/html",
-    });
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    // jsdom does not implement navigator.clipboard; install it directly on
-    // the existing navigator instance so the component's `navigator.clipboard`
-    // global lookup resolves to our mock.
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
     });
     renderWithQuery(
       <HtmlAttachmentPreview
@@ -146,19 +137,13 @@ describe("HtmlAttachmentPreview — toolbar actions", () => {
         onDownload={() => {}}
       />,
     );
-    // Wait until the query resolves and the iframe appears — the Copy button
-    // is rendered in the loading state too (disabled), so we cannot just wait
-    // for it to exist.
     await waitFor(() => expect(document.querySelector("iframe")).toBeTruthy());
-    fireEvent.mouseDown(screen.getByTitle("Copy code"));
-    await waitFor(() => {
-      expect(writeText).toHaveBeenCalledWith("<p>chart source</p>");
-    });
+    expect(screen.queryByTitle("Copy code")).toBeNull();
   });
 });
 
 describe("HtmlAttachmentPreview — failure mode does not unmount the toolbar", () => {
-  it("keeps Open and Download enabled and disables Copy code when fetch errors", async () => {
+  it("keeps Preview and Download enabled when fetch errors", async () => {
     getAttachmentTextContentMock.mockRejectedValueOnce(new Error("nope"));
     const onPreview = vi.fn();
     const onDownload = vi.fn();
@@ -177,16 +162,14 @@ describe("HtmlAttachmentPreview — failure mode does not unmount the toolbar", 
       ).toBeTruthy();
     });
     // Critical: the figure does NOT collapse, and the chrome row is NOT
-    // rendered as a fallback. Open and Download stay reachable.
+    // rendered as a fallback. Preview and Download stay reachable.
     expect(document.querySelector("iframe")).toBeNull();
     expect(screen.queryByText("report.html")).toBeNull();
 
     const previewBtn = screen.getByTitle("Preview") as HTMLButtonElement;
     const downloadBtn = screen.getByTitle("Download") as HTMLButtonElement;
-    const copyBtn = screen.getByTitle("Copy code") as HTMLButtonElement;
     expect(previewBtn.disabled).toBe(false);
     expect(downloadBtn.disabled).toBe(false);
-    expect(copyBtn.disabled).toBe(true);
 
     fireEvent.mouseDown(previewBtn);
     expect(onPreview).toHaveBeenCalled();

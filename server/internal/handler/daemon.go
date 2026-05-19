@@ -1166,10 +1166,6 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	if task.IssueID.Valid {
 		if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
 			resp.WorkspaceID = uuidToString(issue.WorkspaceID)
-			resp.IssueTitle = issue.Title
-			if issue.Description.Valid {
-				resp.IssueDescription = issue.Description.String
-			}
 
 			// Squad-leader briefing injection: when the issue is assigned
 			// to a squad and the claiming agent is that squad's current

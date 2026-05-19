@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -637,14 +638,68 @@ func prettifyJSON(raw []byte) ([]byte, error) {
 	return json.MarshalIndent(v, "", "  ")
 }
 
-// interpolateTemplate replaces {{date}} in the issue title template.
+// issueTitleTemplateTokenRE matches any {{...}} token in an issue-title
+// template. We deliberately permit whitespace inside the braces ({{ date }})
+// so users can format templates either way; the canonical token is still
+// {{date}}.
+var issueTitleTemplateTokenRE = regexp.MustCompile(`\{\{\s*([^{}]*?)\s*\}\}`)
+
+// interpolateTemplate substitutes supported {{name}} placeholders in the
+// issue title template. Whitespace inside the braces ({{ date }}) is
+// tolerated so the render layer accepts every form that
+// ValidateIssueTitleTemplate accepts — otherwise users would save templates
+// that pass validation but still emit a literal token at trigger time.
 func (s *AutopilotService) interpolateTemplate(ap db.Autopilot) string {
 	tmpl := ap.Title
 	if ap.IssueTitleTemplate.Valid && ap.IssueTitleTemplate.String != "" {
 		tmpl = ap.IssueTitleTemplate.String
 	}
 	now := time.Now().UTC().Format("2006-01-02")
-	return strings.ReplaceAll(tmpl, "{{date}}", now)
+	return issueTitleTemplateTokenRE.ReplaceAllStringFunc(tmpl, func(match string) string {
+		name := strings.TrimSpace(match[2 : len(match)-2])
+		switch name {
+		case "date":
+			return now
+		default:
+			return match
+		}
+	})
+}
+
+// SupportedIssueTitleTemplateVariables enumerates the placeholders that
+// interpolateTemplate will substitute. Keep this in sync with the
+// substitution logic above and with the docs in autopilots.mdx /
+// autopilots.zh.mdx.
+var SupportedIssueTitleTemplateVariables = []string{"date"}
+
+// ValidateIssueTitleTemplate rejects templates that contain any {{...}} token
+// other than the supported set. An empty template is valid (the autopilot
+// falls back to its own Title). The error message names the first offending
+// token to keep CLI feedback actionable.
+func ValidateIssueTitleTemplate(tmpl string) error {
+	if tmpl == "" {
+		return nil
+	}
+	for _, m := range issueTitleTemplateTokenRE.FindAllStringSubmatch(tmpl, -1) {
+		name := m[1]
+		if !isSupportedIssueTitleVariable(name) {
+			return fmt.Errorf(
+				"unknown template variable %q; supported: {{%s}}",
+				name,
+				strings.Join(SupportedIssueTitleTemplateVariables, "}}, {{"),
+			)
+		}
+	}
+	return nil
+}
+
+func isSupportedIssueTitleVariable(name string) bool {
+	for _, v := range SupportedIssueTitleTemplateVariables {
+		if name == v {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *AutopilotService) getIssuePrefix(workspaceID pgtype.UUID) string {

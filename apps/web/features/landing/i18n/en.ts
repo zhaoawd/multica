@@ -299,7 +299,6 @@ export function createEnDict(allowSignup: boolean): LandingDict {
         ],
         improvements: [
           "Failed issue actions now show clearer error messages so teams can understand what happened without digging through logs",
-          "Agent runs recover more reliably from stuck commands, idle sessions, and long-running work",
           "GitHub-linked pull requests now surface CI and merge-conflict status inside Multica",
           "Self-hosted deployments get safer defaults and clearer guidance for reverse proxies, auth limits, and local-only services",
           "Search results are ranked more usefully and include better snippets",

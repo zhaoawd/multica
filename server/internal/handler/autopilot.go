@@ -347,6 +347,12 @@ func (h *Handler) CreateAutopilot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "execution_mode must be create_issue or run_only")
 		return
 	}
+	if req.IssueTitleTemplate != nil {
+		if err := service.ValidateIssueTitleTemplate(*req.IssueTitleTemplate); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	workspaceID := h.resolveWorkspaceID(r)
 	userID, ok := requireUserID(w, r)
@@ -440,6 +446,12 @@ func (h *Handler) UpdateAutopilot(w http.ResponseWriter, r *http.Request) {
 		params.Description = ptrToText(req.Description)
 	}
 	if _, ok := rawFields["issue_title_template"]; ok {
+		if req.IssueTitleTemplate != nil {
+			if err := service.ValidateIssueTitleTemplate(*req.IssueTitleTemplate); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		params.IssueTitleTemplate = ptrToText(req.IssueTitleTemplate)
 	}
 	if _, ok := rawFields["assignee_id"]; ok {

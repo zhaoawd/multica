@@ -23,7 +23,6 @@ vi.mock("../i18n", () => ({
           preview_loading: "Loading preview…",
           preview_failed: "Couldn't load preview",
         },
-        code_block: { copy_code: "Copy code" },
         file_card: { uploading: "Uploading {{filename}}" },
       }),
   }),
@@ -60,9 +59,11 @@ describe("AttachmentBlock — dispatcher", () => {
     // HtmlAttachmentPreview never renders the filename row — that's the
     // file-card chrome it replaces.
     expect(screen.queryByText("report.html")).toBeNull();
-    // Toolbar shows the Maximize-style preview button.
+    // Toolbar shows Preview + Download only — attachments are files, not
+    // inline source snippets, so there is no Copy code button.
     expect(screen.getByTitle("Preview")).toBeTruthy();
-    expect(screen.getByTitle("Copy code")).toBeTruthy();
+    expect(screen.getByTitle("Download")).toBeTruthy();
+    expect(screen.queryByTitle("Copy code")).toBeNull();
   });
 
   it("routes html WITHOUT attachmentId to AttachmentCard (URL-only is chrome-only)", () => {
