@@ -128,6 +128,50 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 	})
 }
 
+// registerLarkThreadListeners wires the event bus to the Lark thread
+// bridge (P5 outbound). Agent-authored comments on issues that originated
+// from a Lark thread (lark_issue_link row exists) get mirrored back into
+// the same thread as a "[multica]" reply, so humans in Lark can keep
+// answering the agent without leaving the chat.
+//
+// Loop-prevention: the inbound side (handler.handleLarkMessageEvent's
+// reply branch) stamps source="lark_thread" on its publish; we skip those
+// here so an inbound reply doesn't echo back into the same thread it
+// arrived from. Agent comments published by TaskService never set source,
+// so they pass the filter.
+//
+// Filter: agent author only. Per the design's "agent 写 Q" semantics
+// (§6.6) — human comments in the multica UI are NOT mirrored, so a single
+// reviewer reading the issue page doesn't double-spam the Lark thread.
+func registerLarkThreadListeners(bus *events.Bus, larkThread *service.LarkThreadService, queries *db.Queries) {
+	if larkThread == nil {
+		return
+	}
+	bus.Subscribe(protocol.EventCommentCreated, func(e events.Event) {
+		if !larkThread.Configured() {
+			return
+		}
+		payload, ok := e.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		if src, _ := payload["source"].(string); src == "lark_thread" {
+			return
+		}
+		issueID, authorType, authorID, content, ok := extractCommentFields(payload["comment"])
+		if !ok || authorType != "agent" {
+			return
+		}
+		ctx := context.Background()
+		issueUUID, err := util.ParseUUID(issueID)
+		if err != nil {
+			return
+		}
+		name := larkActorName(ctx, queries, authorType, authorID)
+		larkThread.MirrorAgentCommentToThread(ctx, issueUUID, name, content)
+	})
+}
+
 // larkIssueInfo projects an IssueResponse into the slug-aware IssueInfo
 // the notifier consumes. Falls back to whatever fields are non-empty so a
 // partially-populated payload still yields a usable card.

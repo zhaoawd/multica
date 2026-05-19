@@ -185,6 +185,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// fetch + reply paths. Safe to construct even when Lark is
 	// unconfigured — the service short-circuits to "unavailable".
 	h.LarkThread = service.NewLarkThreadService(queries, pool, bus, larkClient)
+	// P5 outbound bridge: subscribe agent-authored comments to the thread
+	// mirror so clarification questions appear in the originating Lark
+	// thread. Registered here (not in main.go alongside the notifier)
+	// because LarkThread is constructed in this function — keeping the
+	// wiring local makes the dependency direction obvious.
+	registerLarkThreadListeners(bus, h.LarkThread, queries)
 
 	// Wire WS heartbeat after stores are finalized so the WS path uses the
 	// same (possibly Redis-backed) stores as the HTTP path.

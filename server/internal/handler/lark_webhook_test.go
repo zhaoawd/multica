@@ -556,5 +556,135 @@ func TestLarkWebhook_UnboundChat_SilentAck(t *testing.T) {
 	}
 }
 
+// ── P5: outbound mirror (agent comment → Lark thread) ──────────────────
+
+// TestLarkThread_MirrorAgentComment_RepliesIntoThread proves that
+// MirrorAgentCommentToThread:
+//   - resolves the lark_issue_link by issue_id
+//   - posts a "[multica] <author>: <content>" reply via Lark's reply API
+//   - aims at the link.root_message_id (the thread anchor)
+//
+// This is the seam the P5 bus listener uses to bridge agent
+// clarification comments back into the originating Lark thread.
+func TestLarkThread_MirrorAgentComment_RepliesIntoThread(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+
+	var capturedPath string
+	var capturedPayload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tenant_access_token"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "tenant_access_token": "tk", "expire": 7200,
+			})
+		case strings.Contains(r.URL.Path, "/reply"):
+			capturedPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&capturedPayload)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0})
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := service.LarkConfig{AppID: "a", AppSecret: "b", VerificationToken: "verify_test_token", EncryptKey: "encrypt_test_key"}
+	client := service.NewLarkClient(cfg)
+	service.SetAPIBaseForTest(client, srv.URL)
+	prev := testHandler.LarkThread
+	testHandler.LarkThread = service.NewLarkThreadService(testHandler.Queries, testPool, testHandler.Bus, client)
+	t.Cleanup(func() { testHandler.LarkThread = prev })
+
+	// Seed an issue + a lark_issue_link pointing at a known root message.
+	const chatID = "oc_p5_mirror"
+	const rootMsgID = "om_p5_root_for_mirror"
+	var issueID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO issue (workspace_id, title, description, status, priority, creator_type, creator_id, number)
+		VALUES ($1, 'P5 mirror seed', '', 'todo', 'medium', 'member', $2, 9101)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_issue_link (issue_id, chat_id, root_message_id) VALUES ($1, $2, $3)`,
+		issueID, chatID, rootMsgID); err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	var issueUUID pgtype.UUID
+	if err := issueUUID.Scan(issueID); err != nil {
+		t.Fatalf("scan issue uuid: %v", err)
+	}
+	testHandler.LarkThread.MirrorAgentCommentToThread(context.Background(), issueUUID, "CodexBot",
+		"Should this column be UUID or ULID?")
+
+	if !strings.HasSuffix(capturedPath, "/im/v1/messages/"+rootMsgID+"/reply") {
+		t.Fatalf("reply went to %q, want anchor on root message id", capturedPath)
+	}
+	contentStr, _ := capturedPayload["content"].(string)
+	var content struct{ Text string }
+	if err := json.Unmarshal([]byte(contentStr), &content); err != nil {
+		t.Fatalf("decode content: %v", err)
+	}
+	if !strings.HasPrefix(content.Text, "[multica] CodexBot:") {
+		t.Fatalf("body missing prefix/author: %q", content.Text)
+	}
+	if !strings.Contains(content.Text, "Should this column be UUID or ULID?") {
+		t.Fatalf("body missing question: %q", content.Text)
+	}
+}
+
+// TestLarkThread_MirrorAgentComment_NoLinkRowSilentNoop proves that an
+// issue with no lark_issue_link row produces no Lark API call — the
+// mirror is opt-in via the link table; issues born inside multica must
+// not leak into a chat that doesn't know about them.
+func TestLarkThread_MirrorAgentComment_NoLinkRowSilentNoop(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/reply") {
+			calls++
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "tenant_access_token": "tk", "expire": 7200})
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := service.LarkConfig{AppID: "a", AppSecret: "b", VerificationToken: "verify_test_token", EncryptKey: "encrypt_test_key"}
+	client := service.NewLarkClient(cfg)
+	service.SetAPIBaseForTest(client, srv.URL)
+	prev := testHandler.LarkThread
+	testHandler.LarkThread = service.NewLarkThreadService(testHandler.Queries, testPool, testHandler.Bus, client)
+	t.Cleanup(func() { testHandler.LarkThread = prev })
+
+	var issueID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO issue (workspace_id, title, description, status, priority, creator_type, creator_id, number)
+		VALUES ($1, 'P5 mirror no-link', '', 'todo', 'medium', 'member', $2, 9102)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var issueUUID pgtype.UUID
+	if err := issueUUID.Scan(issueID); err != nil {
+		t.Fatalf("scan issue uuid: %v", err)
+	}
+	testHandler.LarkThread.MirrorAgentCommentToThread(context.Background(), issueUUID, "bot", "hello")
+
+	if calls != 0 {
+		t.Fatalf("expected no reply calls for unlinked issue, got %d", calls)
+	}
+}
+
 // silence linter — pgtype is imported by the file via earlier tests.
 var _ = pgtype.Text{}

@@ -306,6 +306,41 @@ func TestLarkClient_ReplyToMessage_PostsExpectedShape(t *testing.T) {
 	}
 }
 
+func TestBuildBridgedCommentText_HasMulticaPrefixAndAuthor(t *testing.T) {
+	got := buildBridgedCommentText("CodexBot", "What runtime should I use for the migration?")
+	if !strings.HasPrefix(got, "[multica] CodexBot: ") {
+		t.Fatalf("missing prefix/author: %q", got)
+	}
+	if !strings.Contains(got, "What runtime should I use for the migration?") {
+		t.Fatalf("missing content: %q", got)
+	}
+}
+
+func TestBuildBridgedCommentText_AnonymousAuthorOmitsByline(t *testing.T) {
+	// authorName is best-effort — a failed lookup must not yield a stray
+	// ": " separator that reads like the comment is from a user named "".
+	got := buildBridgedCommentText("", "hello")
+	if got != "[multica] hello" {
+		t.Fatalf("got %q, want [multica] hello", got)
+	}
+}
+
+func TestBuildBridgedCommentText_TrimsAndTruncates(t *testing.T) {
+	long := strings.Repeat("x", LarkBridgedCommentMaxRunes+50)
+	got := buildBridgedCommentText("bot", long)
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("expected ellipsis on truncated body, got suffix %q", got[len(got)-5:])
+	}
+}
+
+func TestBuildBridgedCommentText_EmptyAfterTrimReturnsEmpty(t *testing.T) {
+	// Whitespace-only content is a no-op so the listener doesn't post
+	// "[multica] bot: " into the thread — that would look like a glitch.
+	if got := buildBridgedCommentText("bot", "   \n\t  "); got != "" {
+		t.Fatalf("got %q, want empty for whitespace content", got)
+	}
+}
+
 func TestLarkThreadService_Configured_NilSafe(t *testing.T) {
 	var s *LarkThreadService
 	if s.Configured() {

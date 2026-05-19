@@ -30,6 +30,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -392,6 +393,79 @@ func (s *LarkThreadService) CreateIssueFromThread(
 		},
 	})
 	return issue, nil
+}
+
+// LarkBridgedCommentMaxRunes caps how much of an agent comment is mirrored
+// into the Lark thread. Long agent dumps (test output, stack traces) would
+// blow out the thread UI; the issue page in multica holds the full text and
+// is one click away via the original confirmation reply.
+const LarkBridgedCommentMaxRunes = 800
+
+// MirrorAgentCommentToThread bridges one agent-authored multica comment
+// back into the originating Lark thread (P5 outbound). The anchor is
+// lark_issue_link.root_message_id; an issue with no link row is silently
+// ignored (it did not originate from a Lark thread).
+//
+// authorName is best-effort presentational text. content is the raw
+// comment body — markdown is left intact (Lark renders it as plain text
+// in the reply, which is acceptable for the short clarification questions
+// this bridge is designed to carry).
+//
+// Lark API errors are logged at WARN, never returned: the comment already
+// exists in multica, and a failed cosmetic mirror must not surface as a
+// caller-visible error from the bus dispatch goroutine.
+func (s *LarkThreadService) MirrorAgentCommentToThread(ctx context.Context, issueID pgtype.UUID, authorName, content string) {
+	if s == nil || s.Client == nil || !s.Client.cfg.Configured() {
+		return
+	}
+	if !issueID.Valid {
+		return
+	}
+	link, err := s.Queries.GetLarkIssueLinkByIssueID(ctx, issueID)
+	if err != nil {
+		// pgx.ErrNoRows is the common case — the issue was not created
+		// from a Lark thread, so there is no thread to reply into. Other
+		// errors are also non-fatal: skipping the cosmetic mirror is
+		// strictly safer than retrying inside the bus goroutine.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("lark thread: link lookup failed",
+				"err", err,
+				"issue_id", util.UUIDToString(issueID),
+			)
+		}
+		return
+	}
+	if link.RootMessageID == "" {
+		return
+	}
+	body := buildBridgedCommentText(authorName, content)
+	if body == "" {
+		return
+	}
+	if err := s.Client.ReplyToMessage(ctx, link.RootMessageID, body); err != nil {
+		slog.Warn("lark thread: mirror agent comment failed",
+			"err", err,
+			"issue_id", util.UUIDToString(issueID),
+			"root_message_id", link.RootMessageID,
+		)
+	}
+}
+
+// buildBridgedCommentText formats an agent comment for posting into the
+// Lark thread. The "[multica]" prefix marks the message as bridge traffic
+// so humans in the chat don't misread it as a native Lark user reply.
+// The content is truncated to LarkBridgedCommentMaxRunes; the full text
+// remains in the multica issue.
+func buildBridgedCommentText(authorName, content string) string {
+	c := strings.TrimSpace(content)
+	if c == "" {
+		return ""
+	}
+	c = truncateRunes(c, LarkBridgedCommentMaxRunes)
+	if strings.TrimSpace(authorName) == "" {
+		return fmt.Sprintf("[multica] %s", c)
+	}
+	return fmt.Sprintf("[multica] %s: %s", strings.TrimSpace(authorName), c)
 }
 
 // ReplyWithIssueCreated posts "已创建 multica-NN — <title>" back into
