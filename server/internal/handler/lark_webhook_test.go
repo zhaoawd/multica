@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/service"
 )
 
@@ -370,6 +371,13 @@ func seedLarkChatBinding(t *testing.T, chatID string) {
 // subscription envelope. Only the fields the dispatcher reads are
 // populated — everything else stays defaulted.
 func buildLarkV2MessageEvent(senderOpenID, chatID, threadID, messageID, text string) []byte {
+	return buildLarkV2MessageEventWithRoot(senderOpenID, chatID, threadID, "", messageID, text)
+}
+
+// buildLarkV2MessageEventWithRoot is the variant that also sets root_id,
+// used by the P5 inbound bridge tests. The bridge keys on root_id (the
+// thread root Lark sets on every reply) to look up the lark_issue_link.
+func buildLarkV2MessageEventWithRoot(senderOpenID, chatID, threadID, rootID, messageID, text string) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"schema": "2.0",
 		"header": map[string]any{
@@ -385,6 +393,7 @@ func buildLarkV2MessageEvent(senderOpenID, chatID, threadID, messageID, text str
 				"message_id":   messageID,
 				"chat_id":      chatID,
 				"thread_id":    threadID,
+				"root_id":      rootID,
 				"message_type": "text",
 				"content":      `{"text":"` + text + `"}`,
 				"create_time":  "1747555200000",
@@ -683,6 +692,182 @@ func TestLarkThread_MirrorAgentComment_NoLinkRowSilentNoop(t *testing.T) {
 
 	if calls != 0 {
 		t.Fatalf("expected no reply calls for unlinked issue, got %d", calls)
+	}
+}
+
+// ── P5.B: inbound clarification bridge (thread reply → multica comment) ─
+
+// seedLarkIssueLink seeds an issue + lark_issue_link row pointing at
+// rootMsgID for the test workspace. Returns the issue UUID string and
+// registers cleanup to delete both rows.
+func seedLarkIssueLink(t *testing.T, chatID, rootMsgID, title string, number int) string {
+	t.Helper()
+	var issueID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO issue (workspace_id, title, description, status, priority, creator_type, creator_id, number)
+		VALUES ($1, $2, '', 'todo', 'medium', 'member', $3, $4)
+		RETURNING id
+	`, testWorkspaceID, title, testUserID, number).Scan(&issueID); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_issue_link (issue_id, chat_id, root_message_id) VALUES ($1, $2, $3)`,
+		issueID, chatID, rootMsgID); err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+	return issueID
+}
+
+func TestLarkWebhook_InboundReply_LinkedSenderLandsAsComment(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	const chatID = "oc_p5_inbound_happy"
+	const rootMsgID = "om_p5_inbound_root"
+	const openID = "ou_p5_inbound_user"
+
+	seedLarkChatBinding(t, chatID)
+	issueID := seedLarkIssueLink(t, chatID, rootMsgID, "P5 inbound seed", 9201)
+
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_user_link (user_id, lark_open_id) VALUES ($1, $2)`,
+		testUserID, openID); err != nil {
+		t.Fatalf("seed user link: %v", err)
+	}
+
+	// Subscribe to the bus so we can verify the inbound bridge stamps
+	// source="lark_thread" on its publish — that's the contract the
+	// P5.A outbound listener relies on to avoid ping-pong loops.
+	var captured map[string]any
+	testHandler.Bus.Subscribe("comment:created", func(e events.Event) {
+		if m, ok := e.Payload.(map[string]any); ok {
+			captured = m
+		}
+	})
+
+	body := buildLarkV2MessageEventWithRoot(openID, chatID, "", rootMsgID, "om_reply_1",
+		"Use UUID — ULID would break the migration ordering.")
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
+	rr := httptest.NewRecorder()
+	testHandler.HandleLarkWebhook(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+
+	// A comment row landed on the linked issue, attributed to the
+	// resolved member.
+	var count int
+	var authorType, authorID, content string
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT count(*) FROM comment WHERE issue_id = $1
+	`, issueID).Scan(&count); err != nil {
+		t.Fatalf("count comments: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("comment count = %d, want 1", count)
+	}
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT author_type, author_id::text, content FROM comment WHERE issue_id = $1
+	`, issueID).Scan(&authorType, &authorID, &content); err != nil {
+		t.Fatalf("read comment: %v", err)
+	}
+	if authorType != "member" || authorID != testUserID {
+		t.Fatalf("author = (%q, %q), want member/testUserID", authorType, authorID)
+	}
+	if !strings.Contains(content, "Use UUID") {
+		t.Fatalf("content = %q", content)
+	}
+
+	// The event must carry source="lark_thread" so the outbound mirror
+	// listener skips it.
+	if captured == nil {
+		t.Fatalf("no comment:created event observed")
+	}
+	if src, _ := captured["source"].(string); src != "lark_thread" {
+		t.Fatalf("event source = %q, want lark_thread (loop guard)", src)
+	}
+}
+
+func TestLarkWebhook_InboundReply_UnknownRootSilentDrop(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	const chatID = "oc_p5_inbound_unknown_root"
+	const openID = "ou_p5_unknown_root_user"
+	seedLarkChatBinding(t, chatID)
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_user_link (user_id, lark_open_id) VALUES ($1, $2)`,
+		testUserID, openID); err != nil {
+		t.Fatalf("seed user link: %v", err)
+	}
+
+	// Same chat as the binding, but the root_id points at a thread we
+	// never bridged. Must NOT silently create a comment on some
+	// unrelated issue, and must NOT create a comment at all.
+	body := buildLarkV2MessageEventWithRoot(openID, chatID, "", "om_unbridged_root", "om_reply_x",
+		"replying to a thread we never bridged")
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
+	rr := httptest.NewRecorder()
+	testHandler.HandleLarkWebhook(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+
+	// No comment with this content anywhere.
+	var count int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM comment WHERE content = $1`,
+		"replying to a thread we never bridged").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("comment created for unbridged root (count=%d)", count)
+	}
+}
+
+func TestLarkWebhook_InboundReply_UnlinkedSenderSilentDrop(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	const chatID = "oc_p5_inbound_unlinked"
+	const rootMsgID = "om_p5_inbound_unlinked_root"
+	seedLarkChatBinding(t, chatID)
+	issueID := seedLarkIssueLink(t, chatID, rootMsgID, "P5 inbound unlinked seed", 9202)
+
+	body := buildLarkV2MessageEventWithRoot("ou_p5_not_linked_sender", chatID, "", rootMsgID, "om_reply_2",
+		"reply from a user who hasn't linked")
+	req := httptest.NewRequest(http.MethodPost, "/api/webhooks/lark", bytes.NewReader(body))
+	signLarkRequest(req, body)
+	rr := httptest.NewRecorder()
+	testHandler.HandleLarkWebhook(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+
+	// No comment landed: unlinked sender must NOT be attributed to
+	// the issue's creator or any other multica user.
+	var count int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM comment WHERE issue_id = $1`, issueID).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("comment created for unlinked sender (count=%d)", count)
 	}
 }
 

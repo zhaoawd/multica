@@ -399,8 +399,15 @@ func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWri
 	cleaned := service.StripLarkMentionPlaceholders(rawText)
 	verb, remainder := service.ParseLarkBotVerb(cleaned)
 	if verb == service.LarkVerbNone {
-		// No recognised verb — silently ignore per the design's
-		// no-NLU rule (§6.5: "avoid misfires").
+		// P5 inbound clarification bridge: a non-verb message that is a
+		// reply inside a thread we already bridged (lark_issue_link row
+		// exists for the root) is treated as a Lark-side answer to an
+		// agent's question — land it as a multica comment on the linked
+		// issue. Outside that narrow shape we silently ignore the
+		// message per the design's no-NLU rule (§6.5: "avoid misfires").
+		if evt.Event.Message.RootID != "" {
+			h.handleLarkInboundReply(ctx, msg, evt.Event.Sender.SenderID.OpenID, cleaned)
+		}
 		return
 	}
 
@@ -546,5 +553,145 @@ func (h *Handler) replyToLarkMessage(ctx context.Context, messageID, text string
 	}
 	if err := h.LarkThread.Client.ReplyToMessage(ctx, messageID, text); err != nil {
 		slog.Warn("lark @bot: reply failed", "err", err, "message_id", messageID)
+	}
+}
+
+// ── P5: inbound clarification bridge (thread reply → multica comment) ──
+
+// handleLarkInboundReply lands a Lark thread reply as a multica comment
+// on the issue the thread is bridged to. The anchor for the lookup is
+// the message's `root_id` field, which Lark sets to the original thread
+// root for every reply (regardless of whether the user replied to the
+// root directly or to a later message in the chain).
+//
+// The bridge fires only when:
+//   - The thread root is in lark_issue_link (i.e. the issue actually
+//     came from this thread — we don't try to guess for unrelated
+//     threads the bot happens to be in).
+//   - The chat is still bound to the same workspace (an operator who
+//     unbinds the chat is opting out of the bridge for future replies).
+//   - The sender has a lark_user_link and is a member of the workspace.
+//
+// Failures at every step are silent: no error reply into the chat. A
+// Lark user who happens to reply in a bridged thread without being
+// linked is not abusing the bot, and an automated error message would
+// be noisier than just dropping. The @bot create-issue path still
+// surfaces the "bind your account" hint, which is the intended
+// onboarding nudge.
+func (h *Handler) handleLarkInboundReply(ctx context.Context, msg larkInboundMessage, senderOpenID, content string) {
+	if h.TaskService == nil || senderOpenID == "" || msg.RootID == "" {
+		return
+	}
+	body := strings.TrimSpace(content)
+	if body == "" {
+		return
+	}
+
+	link, err := h.Queries.GetLarkIssueLinkByRootMessage(ctx, msg.RootID)
+	if err != nil {
+		// pgx.ErrNoRows is the common case: a reply in an unrelated
+		// thread that the bot happens to be in. Other errors are also
+		// non-fatal — the bridge is best-effort.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("lark inbound: link lookup", "err", err, "root_id", msg.RootID)
+		}
+		return
+	}
+	// Sanity: the link row's chat_id must match the message's chat. A
+	// mismatch could mean the thread root was somehow attributed to a
+	// different chat than the one we're now seeing replies in. Drop
+	// rather than misroute the comment.
+	if link.ChatID != msg.ChatID {
+		slog.Warn("lark inbound: chat_id mismatch",
+			"link_chat", link.ChatID, "msg_chat", msg.ChatID, "root", msg.RootID)
+		return
+	}
+
+	// Load the linked issue so we have workspace + assignee context.
+	issue, err := h.Queries.GetIssue(ctx, link.IssueID)
+	if err != nil {
+		slog.Warn("lark inbound: issue lookup", "err", err, "issue_id", uuidToString(link.IssueID))
+		return
+	}
+
+	// Chat binding must still exist and point at the same workspace.
+	// This is the operator-controlled gate: unbinding the chat in
+	// settings turns the bridge off going forward, even though the
+	// historical lark_issue_link row remains.
+	binding, err := h.Queries.GetLarkWorkspaceBindingByChatID(ctx, msg.ChatID)
+	if err != nil {
+		return
+	}
+	if uuidToString(binding.WorkspaceID) != uuidToString(issue.WorkspaceID) {
+		slog.Warn("lark inbound: binding workspace drift",
+			"binding_ws", uuidToString(binding.WorkspaceID),
+			"issue_ws", uuidToString(issue.WorkspaceID))
+		return
+	}
+
+	// Resolve sender → multica member.
+	userLink, err := h.Queries.GetLarkUserLinkByOpenID(ctx, senderOpenID)
+	if err != nil {
+		// Unlinked Lark users can still chat in the thread freely — we
+		// just don't bridge their replies. No "bind your account" reply
+		// here on purpose: this is not an @bot invocation, the user
+		// didn't ask for anything from multica.
+		return
+	}
+	if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+		UserID:      userLink.UserID,
+		WorkspaceID: issue.WorkspaceID,
+	}); err != nil {
+		return
+	}
+
+	// Create the comment. Author is the resolved member; type defaults
+	// to "comment". No parent — the bridge always lands at the top
+	// level so the agent's on_comment trigger reads it as a fresh
+	// reply to the issue.
+	comment, err := h.Queries.CreateComment(ctx, db.CreateCommentParams{
+		IssueID:     issue.ID,
+		WorkspaceID: issue.WorkspaceID,
+		AuthorType:  "member",
+		AuthorID:    userLink.UserID,
+		Content:     body,
+		Type:        "comment",
+		ParentID:    pgtype.UUID{},
+	})
+	if err != nil {
+		slog.Warn("lark inbound: create comment failed",
+			"err", err, "issue_id", uuidToString(issue.ID))
+		return
+	}
+
+	// Project the new comment into the response shape so realtime
+	// consumers receive the same payload as the HTTP CreateComment path.
+	resp := commentToResponse(comment, nil, nil)
+	// source="lark_thread" is the loop-prevention contract the P5.A
+	// outbound listener checks — keeping this in sync means an inbound
+	// reply doesn't echo right back into the same thread.
+	h.publish(protocol.EventCommentCreated, uuidToString(issue.WorkspaceID), "member", uuidToString(userLink.UserID), map[string]any{
+		"comment":             resp,
+		"issue_title":         issue.Title,
+		"issue_assignee_type": textToPtr(issue.AssigneeType),
+		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
+		"issue_status":        issue.Status,
+		"source":              "lark_thread",
+	})
+
+	// Wake the assigned agent's on_comment trigger so the agent reads
+	// the answer and "continues working" per design §6.6 ("agent 在自己
+	// 的 comment 流里看到回答, 继续干"). The CreateComment HTTP handler
+	// applies the same gate — on_comment fires only for member-authored
+	// comments on issues whose assignee is an active agent without a
+	// pending task. We deliberately skip the mention-trigger fan-out
+	// (handler.enqueueMentionedAgentTasks) because Lark message text
+	// can't carry multica @-mentions anyway, and inheriting a thread
+	// root's mentions doesn't apply when there's no multica thread root.
+	if h.shouldEnqueueOnComment(ctx, issue) {
+		if _, err := h.TaskService.EnqueueTaskForIssue(ctx, issue, comment.ID); err != nil {
+			slog.Warn("lark inbound: enqueue on_comment failed",
+				"err", err, "issue_id", uuidToString(issue.ID))
+		}
 	}
 }
