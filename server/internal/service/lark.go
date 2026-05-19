@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,10 +41,19 @@ const (
 	larkAPIBase             = "https://open.feishu.cn/open-apis"
 	larkTokenPath           = "/auth/v3/tenant_access_token/internal"
 	larkSendMessagePath     = "/im/v1/messages?receive_id_type=chat_id"
+	larkReplyMessagePath    = "/im/v1/messages/%s/reply"
+	larkListMessagesPath    = "/im/v1/messages"
 	larkAuthorizeURL        = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
 	larkOIDCAccessTokenPath = "/authen/v1/oidc/access_token"
 	larkTokenSafetyMargin   = 60 * time.Second // refresh slightly before expiry
 	larkDefaultHTTPTimeout  = 10 * time.Second
+
+	// LarkMaxThreadFetchMessages caps how many messages from a Lark thread
+	// the @bot 创建任务 verb pulls into the issue description. The list API
+	// pages at 50; we stop short of one page so even a chatty thread stays
+	// within a single API call. Older messages are dropped — issue body is
+	// human-readable text, not a forensic transcript.
+	LarkMaxThreadFetchMessages = 30
 )
 
 // LarkConfig captures the four env vars that gate the Lark integration.
@@ -100,6 +110,20 @@ func NewLarkClient(cfg LarkConfig) *LarkClient {
 		httpClient: &http.Client{Timeout: larkDefaultHTTPTimeout},
 		apiBase:    larkAPIBase,
 	}
+}
+
+// SetAPIBaseForTest substitutes the Lark API base URL — only intended
+// for tests in other packages that need to point a real *LarkClient at
+// a httptest.Server. Calling this from production code is a bug; the
+// production base is the const larkAPIBase set in NewLarkClient.
+//
+// We expose this rather than making apiBase exported because production
+// code has no reason to mutate it and a public field invites accidents.
+func SetAPIBaseForTest(c *LarkClient, base string) {
+	if c == nil {
+		return
+	}
+	c.apiBase = base
 }
 
 // tenantAccessToken returns a valid app-level tenant_access_token,
@@ -201,6 +225,188 @@ func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, car
 		return fmt.Errorf("lark send: code=%d msg=%s", out.Code, out.Msg)
 	}
 	return nil
+}
+
+// ── Thread / reply (P4) ─────────────────────────────────────────────────
+
+// LarkThreadMessage is a single message returned by Lark's /im/v1/messages
+// list endpoint, projected into the fields the @bot 创建任务 flow needs.
+//
+// Text is the message body extracted from Lark's wire format (Lark
+// embeds text messages as `{"text":"..."}` in `content`). For non-text
+// messages (image, file, sticker, ...) Text is the empty string —
+// callers either skip the message or render a placeholder.
+type LarkThreadMessage struct {
+	MessageID    string
+	SenderOpenID string
+	CreatedAt    time.Time
+	Text         string
+}
+
+// ReplyToMessage posts a text reply to a previously-sent Lark message.
+// Used by P4's @bot 创建任务 to confirm "已创建 multica-NN" back into
+// the thread the user @-mentioned the bot in. Lark's reply endpoint
+// auto-threads the response when `reply_in_thread=true` is passed, which
+// keeps the conversation grouped in the Lark client UI.
+//
+// `text` is plain text. Lark renders it inside a system "rich text"
+// payload, so we marshal it through their expected `{"text":"..."}`
+// envelope. No card / Markdown — keep the @bot reply boring and clear.
+func (c *LarkClient) ReplyToMessage(ctx context.Context, messageID, text string) error {
+	if !c.cfg.Configured() {
+		return errors.New("lark not configured")
+	}
+	if messageID == "" {
+		return errors.New("message_id required")
+	}
+	contentBytes, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"content":         string(contentBytes),
+		"msg_type":        "text",
+		"reply_in_thread": true,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	token, err := c.tenantAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf(c.apiBase+larkReplyMessagePath, messageID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return fmt.Errorf("lark reply: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("lark reply: code=%d msg=%s", out.Code, out.Msg)
+	}
+	return nil
+}
+
+// ListThreadMessages returns up to `limit` messages from a Lark thread,
+// ordered oldest → newest (the same order the user sees them).
+//
+// `threadID` is the `thread_id` field from Lark's event subscription
+// payload, which Lark also accepts as the `container_id` query parameter.
+// The list endpoint pages — for P4 we only fetch the first page and cap
+// at LarkMaxThreadFetchMessages, since the issue body is built for human
+// readability, not transcript fidelity.
+func (c *LarkClient) ListThreadMessages(ctx context.Context, threadID string, limit int) ([]LarkThreadMessage, error) {
+	if !c.cfg.Configured() {
+		return nil, errors.New("lark not configured")
+	}
+	if threadID == "" {
+		return nil, errors.New("thread_id required")
+	}
+	if limit <= 0 || limit > LarkMaxThreadFetchMessages {
+		limit = LarkMaxThreadFetchMessages
+	}
+
+	q := url.Values{}
+	q.Set("container_id_type", "thread")
+	q.Set("container_id", threadID)
+	q.Set("sort_type", "ByCreateTimeAsc")
+	q.Set("page_size", fmt.Sprintf("%d", limit))
+
+	token, err := c.tenantAccessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := c.apiBase + larkListMessagesPath + "?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Items []struct {
+				MessageID  string `json:"message_id"`
+				CreateTime string `json:"create_time"` // Lark sends milliseconds as a string
+				MsgType    string `json:"msg_type"`
+				Body       struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Sender struct {
+					ID     string `json:"id"`
+					IDType string `json:"id_type"`
+				} `json:"sender"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("lark thread list: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if out.Code != 0 {
+		return nil, fmt.Errorf("lark thread list: code=%d msg=%s", out.Code, out.Msg)
+	}
+
+	msgs := make([]LarkThreadMessage, 0, len(out.Data.Items))
+	for _, item := range out.Data.Items {
+		// Lark text messages embed the visible body as JSON
+		// `{"text":"..."}` in body.content. Other msg_types (post, image,
+		// file, sticker, ...) come through here too but with no
+		// human-readable text we can pull cleanly — skip them.
+		text := ""
+		if item.MsgType == "text" && item.Body.Content != "" {
+			var inner struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal([]byte(item.Body.Content), &inner); err == nil {
+				text = inner.Text
+			}
+		}
+		msgs = append(msgs, LarkThreadMessage{
+			MessageID:    item.MessageID,
+			SenderOpenID: item.Sender.ID,
+			CreatedAt:    parseLarkCreateTime(item.CreateTime),
+			Text:         text,
+		})
+	}
+	return msgs, nil
+}
+
+// parseLarkCreateTime decodes Lark's create_time string (epoch
+// milliseconds, sent as a quoted JSON string) into time.Time. Returns
+// the zero value on parse failure so callers can fall back gracefully
+// — the timestamp is informational in the issue description, not a
+// foreign key.
+func parseLarkCreateTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	ms, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms).UTC()
 }
 
 // ── User OAuth (P2) ─────────────────────────────────────────────────────────
