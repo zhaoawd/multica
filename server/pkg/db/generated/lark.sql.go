@@ -11,6 +11,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteLarkIssueLink = `-- name: DeleteLarkIssueLink :exec
+DELETE FROM lark_issue_link WHERE issue_id = $1
+`
+
+func (q *Queries) DeleteLarkIssueLink(ctx context.Context, issueID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteLarkIssueLink, issueID)
+	return err
+}
+
 const deleteLarkUserLink = `-- name: DeleteLarkUserLink :exec
 DELETE FROM lark_user_link WHERE user_id = $1
 `
@@ -27,6 +36,40 @@ DELETE FROM lark_workspace_binding WHERE workspace_id = $1
 func (q *Queries) DeleteLarkWorkspaceBinding(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteLarkWorkspaceBinding, workspaceID)
 	return err
+}
+
+const getLarkIssueLinkByIssueID = `-- name: GetLarkIssueLinkByIssueID :one
+SELECT issue_id, chat_id, root_message_id, created_at FROM lark_issue_link
+WHERE issue_id = $1
+`
+
+func (q *Queries) GetLarkIssueLinkByIssueID(ctx context.Context, issueID pgtype.UUID) (LarkIssueLink, error) {
+	row := q.db.QueryRow(ctx, getLarkIssueLinkByIssueID, issueID)
+	var i LarkIssueLink
+	err := row.Scan(
+		&i.IssueID,
+		&i.ChatID,
+		&i.RootMessageID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getLarkIssueLinkByRootMessage = `-- name: GetLarkIssueLinkByRootMessage :one
+SELECT issue_id, chat_id, root_message_id, created_at FROM lark_issue_link
+WHERE root_message_id = $1
+`
+
+func (q *Queries) GetLarkIssueLinkByRootMessage(ctx context.Context, rootMessageID string) (LarkIssueLink, error) {
+	row := q.db.QueryRow(ctx, getLarkIssueLinkByRootMessage, rootMessageID)
+	var i LarkIssueLink
+	err := row.Scan(
+		&i.IssueID,
+		&i.ChatID,
+		&i.RootMessageID,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const getLarkUserLink = `-- name: GetLarkUserLink :one
@@ -86,6 +129,59 @@ func (q *Queries) GetLarkWorkspaceBinding(ctx context.Context, workspaceID pgtyp
 		&i.EnabledEvents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getLarkWorkspaceBindingByChatID = `-- name: GetLarkWorkspaceBindingByChatID :one
+SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at FROM lark_workspace_binding
+WHERE chat_id = $1
+`
+
+func (q *Queries) GetLarkWorkspaceBindingByChatID(ctx context.Context, chatID string) (LarkWorkspaceBinding, error) {
+	row := q.db.QueryRow(ctx, getLarkWorkspaceBindingByChatID, chatID)
+	var i LarkWorkspaceBinding
+	err := row.Scan(
+		&i.WorkspaceID,
+		&i.ChatID,
+		&i.BotTokenEnc,
+		&i.EnabledEvents,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const insertLarkIssueLink = `-- name: InsertLarkIssueLink :one
+
+INSERT INTO lark_issue_link (
+    issue_id, chat_id, root_message_id
+) VALUES (
+    $1, $2, $3
+)
+ON CONFLICT (issue_id) DO UPDATE SET
+    chat_id         = EXCLUDED.chat_id,
+    root_message_id = EXCLUDED.root_message_id
+RETURNING issue_id, chat_id, root_message_id, created_at
+`
+
+type InsertLarkIssueLinkParams struct {
+	IssueID       pgtype.UUID `json:"issue_id"`
+	ChatID        string      `json:"chat_id"`
+	RootMessageID string      `json:"root_message_id"`
+}
+
+// =====================
+// Lark issue link (P4)
+// =====================
+func (q *Queries) InsertLarkIssueLink(ctx context.Context, arg InsertLarkIssueLinkParams) (LarkIssueLink, error) {
+	row := q.db.QueryRow(ctx, insertLarkIssueLink, arg.IssueID, arg.ChatID, arg.RootMessageID)
+	var i LarkIssueLink
+	err := row.Scan(
+		&i.IssueID,
+		&i.ChatID,
+		&i.RootMessageID,
+		&i.CreatedAt,
 	)
 	return i, err
 }

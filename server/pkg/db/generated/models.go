@@ -382,6 +382,13 @@ type IssueToLabel struct {
 	LabelID pgtype.UUID `json:"label_id"`
 }
 
+type LarkIssueLink struct {
+	IssueID       pgtype.UUID        `json:"issue_id"`
+	ChatID        string             `json:"chat_id"`
+	RootMessageID string             `json:"root_message_id"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
 type LarkUserLink struct {
 	UserID          pgtype.UUID        `json:"user_id"`
 	LarkOpenID      string             `json:"lark_open_id"`

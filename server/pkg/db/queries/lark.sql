@@ -6,6 +6,10 @@
 SELECT * FROM lark_workspace_binding
 WHERE workspace_id = $1;
 
+-- name: GetLarkWorkspaceBindingByChatID :one
+SELECT * FROM lark_workspace_binding
+WHERE chat_id = $1;
+
 -- name: ListLarkWorkspaceBindings :many
 SELECT * FROM lark_workspace_binding
 ORDER BY created_at ASC;
@@ -59,3 +63,29 @@ RETURNING *;
 
 -- name: DeleteLarkUserLink :exec
 DELETE FROM lark_user_link WHERE user_id = $1;
+
+-- =====================
+-- Lark issue link (P4)
+-- =====================
+
+-- name: InsertLarkIssueLink :one
+INSERT INTO lark_issue_link (
+    issue_id, chat_id, root_message_id
+) VALUES (
+    $1, $2, $3
+)
+ON CONFLICT (issue_id) DO UPDATE SET
+    chat_id         = EXCLUDED.chat_id,
+    root_message_id = EXCLUDED.root_message_id
+RETURNING *;
+
+-- name: GetLarkIssueLinkByIssueID :one
+SELECT * FROM lark_issue_link
+WHERE issue_id = $1;
+
+-- name: GetLarkIssueLinkByRootMessage :one
+SELECT * FROM lark_issue_link
+WHERE root_message_id = $1;
+
+-- name: DeleteLarkIssueLink :exec
+DELETE FROM lark_issue_link WHERE issue_id = $1;
