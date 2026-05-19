@@ -85,7 +85,7 @@ func validateGithubRepoRef(ref json.RawMessage) (json.RawMessage, error) {
 		return nil, errors.New("github_repo: url is required")
 	}
 	if !isValidGitRepoURL(payload.URL) {
-		return nil, errors.New("github_repo: url must be a valid http(s) or ssh git URL")
+		return nil, errors.New("github_repo: url must be a valid http(s)/ssh git URL or file:///abs/path for a local repo")
 	}
 	payload.DefaultBranchHint = strings.TrimSpace(payload.DefaultBranchHint)
 	out, err := json.Marshal(payload)
@@ -95,17 +95,32 @@ func validateGithubRepoRef(ref json.RawMessage) (json.RawMessage, error) {
 	return out, nil
 }
 
-// isValidGitRepoURL accepts the three forms a user can paste from GitHub's
-// "Code" menu: https://, ssh:// (with explicit scheme), and the scp-like
-// shorthand `git@host:owner/repo.git`. The check is intentionally lax — we are
-// guarding against pasted garbage like "not-a-url", not enforcing a strict
-// grammar — because the actual fetch happens client-side via `git clone` and
-// the user gets a clearer error from git than from us.
+// isValidGitRepoURL accepts the four forms a user can paste:
+//   - https:// or http:// (the "Code" menu copy from GitHub/GitLab/Gitea)
+//   - ssh:// with explicit scheme
+//   - scp-like shorthand `git@host:owner/repo.git`
+//   - file:///abs/path for a local repository on the same machine as the daemon
+//
+// The check is intentionally lax — we are guarding against pasted garbage like
+// "not-a-url", not enforcing a strict grammar — because the actual fetch
+// happens via `git clone` on the daemon and the user gets a clearer error
+// from git than from us. Existence of the local path is not checked here:
+// the server may run on a different host than the daemon, so a `file://` URL
+// that's valid for the daemon doesn't have to resolve on the server. The
+// daemon surfaces a clear clone error at sync time if the path is missing
+// or not a git repo.
 func isValidGitRepoURL(s string) bool {
-	if u, err := url.Parse(s); err == nil && u.Host != "" {
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" {
 		switch u.Scheme {
 		case "http", "https", "ssh", "git":
-			return true
+			return u.Host != ""
+		case "file":
+			// file://host/path is rejected: it pulls in NFS / SMB semantics
+			// that we don't want to mediate here. Require an empty host and
+			// a non-trivial absolute path. Windows paths like
+			// file:///C:/Users/me/repo come through with Path="/C:/..." and
+			// satisfy this check.
+			return u.Host == "" && len(u.Path) > 1 && strings.HasPrefix(u.Path, "/")
 		}
 	}
 	// scp-like ssh shorthand: [user@]host:path with a non-empty host and path,

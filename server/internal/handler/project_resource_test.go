@@ -194,6 +194,57 @@ func TestProjectResourceAcceptsSSHRepoURLs(t *testing.T) {
 	}
 }
 
+// TestProjectResourceAcceptsLocalFileURL covers the local-repo path: a
+// file:///abs/path URL must be accepted so a user can attach a repository
+// that lives on the same machine as the daemon without writing the path
+// into agent instructions. The daemon reuses its existing bare-clone +
+// worktree pipeline for file:// URLs; the handler only needs to let the
+// payload past validation.
+func TestProjectResourceAcceptsLocalFileURL(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/projects?workspace_id="+testWorkspaceID, map[string]any{
+		"title": "Local repo acceptance",
+	})
+	testHandler.CreateProject(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateProject: %d %s", w.Code, w.Body.String())
+	}
+	var project ProjectResponse
+	if err := json.NewDecoder(w.Body).Decode(&project); err != nil {
+		t.Fatalf("decode CreateProject: %v", err)
+	}
+	defer func() {
+		r := newRequest("DELETE", "/api/projects/"+project.ID, nil)
+		r = withURLParam(r, "id", project.ID)
+		testHandler.DeleteProject(httptest.NewRecorder(), r)
+	}()
+
+	const localURL = "file:///Users/me/projects/local-repo"
+	w = httptest.NewRecorder()
+	req = newRequest("POST", "/api/projects/"+project.ID+"/resources", map[string]any{
+		"resource_type": "github_repo",
+		"resource_ref":  map[string]any{"url": localURL},
+	})
+	req = withURLParam(req, "id", project.ID)
+	testHandler.CreateProjectResource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateProjectResource(file://): expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var created ProjectResourceResponse
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var ref struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(created.ResourceRef, &ref); err != nil {
+		t.Fatalf("decode resource_ref: %v", err)
+	}
+	if ref.URL != localURL {
+		t.Errorf("ref.url = %q, want %q", ref.URL, localURL)
+	}
+}
+
 func TestIsValidGitRepoURL(t *testing.T) {
 	good := []string{
 		"https://github.com/multica-ai/multica",
@@ -203,6 +254,12 @@ func TestIsValidGitRepoURL(t *testing.T) {
 		"ssh://git@github.com:22/multica-ai/multica.git",
 		"git@github.com:multica-ai/multica.git",
 		"git@gitlab.example.com:group/sub/repo.git",
+		// Local repository on the same machine as the daemon — the bare-clone
+		// pipeline handles file:// URLs natively, so no separate validation
+		// path is needed beyond accepting the scheme.
+		"file:///tmp/repo",
+		"file:///Users/me/projects/my-repo.git",
+		"file:///C:/Users/me/repo", // Windows path through URL form
 	}
 	bad := []string{
 		"",
@@ -213,7 +270,10 @@ func TestIsValidGitRepoURL(t *testing.T) {
 		"git@:foo/bar",                  // missing host
 		"git@github.com:",               // missing path
 		"ftp://example.com/repo",        // unsupported scheme
-		"file:///tmp/repo",              // unsupported scheme
+		"file://hostname/path",          // file:// with host (NFS/SMB-style) not supported
+		"file:///",                      // empty path
+		"file://",                       // no path
+		"file:relative",                 // file: with relative/opaque path
 		"some random text with spaces",
 		"github.com:org/repo@branch",    // '@' after ':' belongs to the path, not user
 		"foo:bar@baz",                   // '@' after ':' with no scheme

@@ -266,6 +266,72 @@ func TestProjectReposReplaceWorkspaceReposInMetaSkill(t *testing.T) {
 	}
 }
 
+// TestFormatProjectResourceLocalRepo asserts that a project_resource whose
+// URL is a `file://` path renders as "Local repo" instead of "GitHub repo".
+// The agent must still see the full checkout URL because `multica repo
+// checkout` takes the raw string verbatim.
+func TestFormatProjectResourceLocalRepo(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		ref      string
+		label    string
+		wantHave []string
+		wantMiss []string
+	}{
+		{
+			name: "local-repo-no-label",
+			ref:  `{"url":"file:///Users/me/projects/local-repo"}`,
+			wantHave: []string{
+				"**Local repo**:",
+				"`/Users/me/projects/local-repo`",
+				"checkout URL: `file:///Users/me/projects/local-repo`",
+			},
+			wantMiss: []string{"GitHub repo"},
+		},
+		{
+			name:  "local-repo-with-label-and-branch-hint",
+			ref:   `{"url":"file:///srv/git/internal.git","default_branch_hint":"trunk"}`,
+			label: "Internal mirror",
+			wantHave: []string{
+				"**Local repo**:",
+				"`/srv/git/internal.git`",
+				"(default branch: `trunk`)",
+				"— Internal mirror",
+			},
+			wantMiss: []string{"GitHub repo"},
+		},
+		{
+			name: "remote-still-renders-as-github-repo",
+			ref:  `{"url":"https://github.com/multica-ai/multica"}`,
+			wantHave: []string{
+				"**GitHub repo**: https://github.com/multica-ai/multica",
+			},
+			wantMiss: []string{"Local repo"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatProjectResource(ProjectResourceForEnv{
+				ResourceType: "github_repo",
+				ResourceRef:  json.RawMessage(tc.ref),
+				Label:        tc.label,
+			})
+			for _, want := range tc.wantHave {
+				if !strings.Contains(got, want) {
+					t.Errorf("formatProjectResource = %q, missing %q", got, want)
+				}
+			}
+			for _, miss := range tc.wantMiss {
+				if strings.Contains(got, miss) {
+					t.Errorf("formatProjectResource = %q, should not contain %q", got, miss)
+				}
+			}
+		})
+	}
+}
+
 func TestWriteProjectResourcesSkippedWhenNone(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

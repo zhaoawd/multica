@@ -53,6 +53,35 @@ func gitEnv() []string {
 
 var agentGitExcludePatterns = []string{".agent_context", "CLAUDE.md", "AGENTS.md", ".claude", ".opencode"}
 
+// localRepoURLPrefix marks repos that live on the same machine as the daemon.
+// For these URLs the cache skips the bare-clone step entirely and creates
+// worktrees directly off the user's local repository — this is the model
+// "Claude Code-like" local agents want, where each task produces a branch
+// in the user's own repo that they can immediately `git checkout` and review.
+const localRepoURLPrefix = "file://"
+
+// isLocalRepoURL reports whether rawURL points at a local-filesystem repo.
+func isLocalRepoURL(rawURL string) bool {
+	return strings.HasPrefix(rawURL, localRepoURLPrefix)
+}
+
+// localRepoPath strips the file:// prefix and returns the filesystem path.
+// Mirrors the handler's accepted forms: file:///abs/path on POSIX and
+// file:///C:/path on Windows both reduce to the absolute path on disk.
+func localRepoPath(rawURL string) string {
+	return strings.TrimPrefix(rawURL, localRepoURLPrefix)
+}
+
+// isLocalGitRepo reports whether path is a usable non-bare git repository.
+// Used during Sync to validate a `file://` URL points at something the
+// worktree pipeline can actually run against, rather than waiting for a
+// confusing `git worktree add` failure at task time.
+func isLocalGitRepo(path string) bool {
+	cmd := exec.Command("git", "-C", path, "rev-parse", "--git-dir")
+	cmd.Env = gitEnv()
+	return cmd.Run() == nil
+}
+
 // RepoInfo describes a repository to cache.
 type RepoInfo struct {
 	URL string
@@ -111,6 +140,26 @@ func (c *Cache) Sync(workspaceID string, repos []RepoInfo) error {
 		if repo.URL == "" {
 			continue
 		}
+		// Local repos (`file://...`) skip the bare-clone step entirely.
+		// CreateWorktree will run `git worktree add` directly against the
+		// user's repository so each task's branch lands in the user's repo
+		// and is immediately visible to them in `git branch`. We still
+		// validate up-front that the path is a real git repo, otherwise
+		// the failure surfaces later as a confusing worktree-add error.
+		if isLocalRepoURL(repo.URL) {
+			path := localRepoPath(repo.URL)
+			if !isLocalGitRepo(path) {
+				err := fmt.Errorf("local repo path is not a git repository: %s", path)
+				c.logger.Error("repo cache: local repo missing", "url", repo.URL, "error", err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			c.logger.Info("repo cache: local repo registered (no clone)", "url", repo.URL, "path", path)
+			continue
+		}
+
 		barePath := filepath.Join(wsDir, bareDirName(repo.URL))
 
 		repoLock := c.lockForRepo(barePath)
@@ -139,9 +188,18 @@ func (c *Cache) Sync(workspaceID string, repos []RepoInfo) error {
 	return firstErr
 }
 
-// Lookup returns the local bare clone path for a repo URL within a workspace.
-// Returns "" if not cached.
+// Lookup returns the git root used to base worktrees on for a repo URL within
+// a workspace. For remote URLs this is the bare clone path under the cache
+// root; for `file://` URLs it is the user's local repository itself (no
+// intermediate bare clone exists). Returns "" if the repo is not available.
 func (c *Cache) Lookup(workspaceID, url string) string {
+	if isLocalRepoURL(url) {
+		path := localRepoPath(url)
+		if isLocalGitRepo(path) {
+			return path
+		}
+		return ""
+	}
 	barePath := filepath.Join(c.root, workspaceID, bareDirName(url))
 	if isBareRepo(barePath) {
 		return barePath
@@ -378,56 +436,69 @@ type WorktreeResult struct {
 	BranchName string `json:"branch_name"` // git branch created for this worktree
 }
 
-// CreateWorktree looks up the bare cache for a repo, fetches latest, and creates
-// a git worktree in the agent's working directory. If a worktree already exists
-// at the target path (reused environment), it updates the existing worktree to
-// the latest remote default branch instead of failing.
+// CreateWorktree looks up the git root for a repo (bare clone for remote URLs,
+// the user's repo itself for `file://` URLs), fetches latest if applicable, and
+// creates a git worktree in the agent's working directory. If a worktree
+// already exists at the target path (reused environment), it updates the
+// existing worktree to the latest remote default branch instead of failing.
 func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	barePath := c.Lookup(params.WorkspaceID, params.RepoURL)
 	if barePath == "" {
 		return nil, fmt.Errorf("repo not found in cache: %s (workspace: %s)", params.RepoURL, params.WorkspaceID)
 	}
+	local := isLocalRepoURL(params.RepoURL)
 
-	// Serialize concurrent CreateWorktree calls on the same bare repo. Git's
+	// Serialize concurrent CreateWorktree calls on the same git root. Git's
 	// own lockfiles (packed-refs.lock, config.lock, worktree admin dirs)
 	// can't tolerate parallel fetch + worktree mutations on the same repo.
+	// For local repos this also serializes against the user running git
+	// commands in their own repo concurrently — those still race, but at
+	// least daemon-initiated mutations on a single path don't pile up.
 	repoLock := c.lockForRepo(barePath)
 	repoLock.Lock()
 	defer repoLock.Unlock()
 
-	// Fetch latest from origin. This also migrates the bare cache's refspec
-	// to the modern remote-tracking layout on first run, so subsequent fetches
-	// never collide with the refs/heads/agent/* branches that worktree creation
-	// locks in this same bare repo.
-	if err := gitFetch(barePath); err != nil {
-		// Non-fatal: preserve cached state and continue, but make the warning
-		// loud enough that it's findable in the daemon log. The agent will
-		// receive an older snapshot than the remote head.
-		c.logger.Warn("repo checkout: fetch failed, agent will see possibly stale code",
-			"url", params.RepoURL,
-			"error", err,
-		)
+	if !local {
+		// Fetch latest from origin. This also migrates the bare cache's refspec
+		// to the modern remote-tracking layout on first run, so subsequent fetches
+		// never collide with the refs/heads/agent/* branches that worktree creation
+		// locks in this same bare repo.
+		if err := gitFetch(barePath); err != nil {
+			// Non-fatal: preserve cached state and continue, but make the warning
+			// loud enough that it's findable in the daemon log. The agent will
+			// receive an older snapshot than the remote head.
+			c.logger.Warn("repo checkout: fetch failed, agent will see possibly stale code",
+				"url", params.RepoURL,
+				"error", err,
+			)
+		}
 	}
 
-	// Determine the ref to base the worktree on. By default this is the remote's
-	// default branch (resolved internally via getRemoteDefaultBranch, which walks
-	// origin/HEAD → origin/main, origin/master → bare-HEAD hint into origin/<same>
-	// → single-entry scan of origin/* → bare HEAD when origin/* is empty).
+	// Determine the ref to base the worktree on. For remote URLs this resolves
+	// against the bare cache's refs/remotes/origin/* namespace; for local repos
+	// it resolves against the user's own refs/heads/* (no origin layer exists).
 	// Callers may request a specific branch, tag, or commit so review/QA agents
 	// can inspect the exact revision without trying to mutate the daemon-owned
 	// worktree metadata themselves.
-	baseRef, err := resolveBaseRef(barePath, params.Ref)
+	var baseRef string
+	var err error
+	if local {
+		baseRef, err = resolveLocalBaseRef(barePath, params.Ref)
+	} else {
+		baseRef, err = resolveBaseRef(barePath, params.Ref)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	// Empty here means params.Ref was unset and getRemoteDefaultBranch couldn't
-	// resolve a default — the cache is in a state we refuse to guess from (no
-	// origin/HEAD, no main/master, bare HEAD doesn't match any origin/* entry,
-	// and origin/* has multiple candidates). The requested-ref path returns an
-	// explicit error before reaching here, so this branch only fires for the
-	// default-branch case.
+	// Empty here means params.Ref was unset and the default-branch resolver
+	// couldn't find one. The requested-ref path returns an explicit error
+	// before reaching here, so this branch only fires for the default-branch
+	// case.
 	if baseRef == "" {
+		if local {
+			return nil, fmt.Errorf("cannot resolve default branch for local repo %s: no HEAD, main, or master ref found", params.RepoURL)
+		}
 		return nil, fmt.Errorf("cannot resolve default branch for %s: bare cache at %s has no usable refs (origin/* is empty or ambiguous and bare HEAD has no match). The cache may be corrupted; delete it and retry", params.RepoURL, barePath)
 	}
 
@@ -455,13 +526,21 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 		// must actively remove it when disabled — otherwise a previously
 		// installed hook keeps appending the trailer to every commit even
 		// after the user toggles the setting off.
-		if params.CoAuthoredByEnabled {
-			if err := installCoAuthoredByHook(worktreePath); err != nil {
-				c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
-			}
-		} else {
-			if err := removeCoAuthoredByHook(worktreePath); err != nil {
-				c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
+		//
+		// Skip entirely for local (`file://`) repos: the "shared hooks dir"
+		// for those is the user's own .git/hooks/, and silently installing
+		// or removing hooks in there would mutate the user's repo state
+		// without their consent. Local-repo users can configure their own
+		// commit trailers via standard git tooling.
+		if !local {
+			if params.CoAuthoredByEnabled {
+				if err := installCoAuthoredByHook(worktreePath); err != nil {
+					c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
+				}
+			} else {
+				if err := removeCoAuthoredByHook(worktreePath); err != nil {
+					c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
+				}
 			}
 		}
 
@@ -491,15 +570,18 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	}
 
 	// Install or remove the Co-authored-by hook based on the workspace
-	// setting. See the existing-worktree branch above for why removal is
-	// required when the setting is disabled.
-	if params.CoAuthoredByEnabled {
-		if err := installCoAuthoredByHook(worktreePath); err != nil {
-			c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
-		}
-	} else {
-		if err := removeCoAuthoredByHook(worktreePath); err != nil {
-			c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
+	// setting. See the existing-worktree branch above for why this is gated
+	// on !local — for local repos the shared hooks dir IS the user's own
+	// repo, and we must not mutate it without consent.
+	if !local {
+		if params.CoAuthoredByEnabled {
+			if err := installCoAuthoredByHook(worktreePath); err != nil {
+				c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
+			}
+		} else {
+			if err := removeCoAuthoredByHook(worktreePath); err != nil {
+				c.logger.Warn("repo checkout: remove co-authored-by hook failed (non-fatal)", "error", err)
+			}
 		}
 	}
 
@@ -535,6 +617,52 @@ func resolveBaseRef(barePath, requestedRef string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("cannot resolve requested ref %q in repo cache at %s", ref, barePath)
+}
+
+// resolveLocalBaseRef picks the base ref for a worktree off a user's local
+// repository. Local repos have no refs/remotes/origin/* layer (the cache
+// doesn't clone them — it points worktrees directly at the user's repo), so
+// resolution walks the user's own refs/heads/* instead.
+//
+// When requestedRef is empty the default tracks the user's own working state:
+// HEAD takes precedence over refs/heads/main / master so the agent works off
+// whatever branch the user currently has checked out. This matches the
+// "Claude Code in my project" mental model — if the user runs the agent from
+// their feature branch, the agent's branch is based on that branch, not on
+// main behind the user's back.
+//
+// When requestedRef is set, it must resolve to a branch, tag, or raw commit in
+// the user's repo; an unresolvable ref returns an explicit error rather than
+// silently falling through to the default.
+func resolveLocalBaseRef(repoPath, requestedRef string) (string, error) {
+	ref := strings.TrimSpace(requestedRef)
+	if ref == "" {
+		// Prefer the user's current HEAD branch — that's the branch they're
+		// working on and the most useful base for "do this task on top of
+		// what I'm doing". Fall back to main/master if HEAD is detached or
+		// otherwise unreadable; finally bail out if neither exists.
+		if head := bareHeadBranch(repoPath); head != "" {
+			return head, nil
+		}
+		for _, candidate := range []string{"refs/heads/main", "refs/heads/master"} {
+			if gitRefExists(repoPath, candidate+"^{commit}") {
+				return candidate, nil
+			}
+		}
+		return "", nil
+	}
+
+	candidates := []string{
+		"refs/heads/" + ref,
+		"refs/tags/" + ref,
+		ref,
+	}
+	for _, candidate := range candidates {
+		if gitRefExists(repoPath, candidate+"^{commit}") {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("cannot resolve requested ref %q in local repo at %s", ref, repoPath)
 }
 
 func gitRefExists(repoPath, ref string) bool {

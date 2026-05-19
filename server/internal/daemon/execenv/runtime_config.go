@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+// localRepoURLPrefix marks a project_resource URL that points at a repository
+// on the same machine as the daemon. The handler accepts file:///abs/path,
+// and the bare-clone pipeline handles it natively — we only need to render it
+// differently in the agent prompt so the agent doesn't see "GitHub repo:
+// file:///..." which is misleading.
+const localRepoURLPrefix = "file://"
+
 // runtimeGOOS is the host-platform string used by buildMetaSkillContent and
 // BuildCommentReplyInstructions to emit Windows-specific guidance. Defaults
 // to runtime.GOOS; tests override it to exercise the cross-platform branches
@@ -28,7 +35,21 @@ func formatProjectResource(r ProjectResourceForEnv) string {
 			DefaultBranchHint string `json:"default_branch_hint,omitempty"`
 		}
 		_ = json.Unmarshal(r.ResourceRef, &payload)
-		out := fmt.Sprintf("**GitHub repo**: %s", payload.URL)
+		// `github_repo` is the historical type name; the underlying transport
+		// is git-clone, so any git-compatible URL is valid. Render local
+		// repositories (`file://...`) as "Local repo" so the agent isn't
+		// told a path on its own host is a GitHub URL. The path shown to the
+		// agent strips the `file://` prefix for readability, but the agent
+		// must pass the full URL (including `file://`) to
+		// `multica repo checkout`, which is documented in the surrounding
+		// section.
+		var out string
+		if strings.HasPrefix(payload.URL, localRepoURLPrefix) {
+			localPath := strings.TrimPrefix(payload.URL, localRepoURLPrefix)
+			out = fmt.Sprintf("**Local repo**: `%s` (checkout URL: `%s`)", localPath, payload.URL)
+		} else {
+			out = fmt.Sprintf("**GitHub repo**: %s", payload.URL)
+		}
 		if payload.DefaultBranchHint != "" {
 			out += fmt.Sprintf(" (default branch: `%s`)", payload.DefaultBranchHint)
 		}

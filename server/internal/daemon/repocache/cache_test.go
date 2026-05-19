@@ -270,6 +270,199 @@ func TestSyncAndLookup(t *testing.T) {
 	}
 }
 
+// TestSyncAndCheckoutForFileURL covers the local-repo path: a `file:///abs`
+// URL must skip the bare-clone step entirely and produce a worktree whose
+// new branch lives in the user's own repository, not in any intermediate
+// cache. This is the "Claude Code-like" workflow — the agent's branch is
+// immediately visible to the user via `git branch` in their checkout.
+func TestSyncAndCheckoutForFileURL(t *testing.T) {
+	t.Parallel()
+	sourcePath := createTestRepo(t)
+	fileURL := "file://" + sourcePath
+	cacheRoot := t.TempDir()
+	cache := New(cacheRoot, testLogger())
+
+	if err := cache.Sync("ws-local", []RepoInfo{{URL: fileURL}}); err != nil {
+		t.Fatalf("Sync(file://) failed: %v", err)
+	}
+
+	// Sync MUST NOT create a bare clone for local repos — the whole point
+	// of the file:// path is to avoid the round-trip and have task branches
+	// land directly in the user's repo. A leftover bare clone here would
+	// regress us back to the old behavior.
+	wsCacheDir := filepath.Join(cacheRoot, "ws-local")
+	if entries, err := os.ReadDir(wsCacheDir); err == nil && len(entries) > 0 {
+		t.Fatalf("expected no cache dirs for file:// URL, got %d entries under %s", len(entries), wsCacheDir)
+	}
+
+	// Lookup must return the user's repo path itself, not a bare-clone path.
+	gitRoot := cache.Lookup("ws-local", fileURL)
+	if gitRoot != sourcePath {
+		t.Fatalf("Lookup(file://) = %q, want %q", gitRoot, sourcePath)
+	}
+	if isBareRepo(gitRoot) {
+		t.Fatalf("expected user repo (non-bare), got bare at %s", gitRoot)
+	}
+
+	workDir := t.TempDir()
+	result, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID: "ws-local",
+		RepoURL:     fileURL,
+		WorkDir:     workDir,
+		AgentName:   "local-agent",
+		TaskID:      "task-abcdef12",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree(file://) failed: %v", err)
+	}
+	if !isGitWorktree(result.Path) {
+		t.Errorf("expected git worktree at %s", result.Path)
+	}
+
+	// The new branch must be visible inside the user's source repo — this
+	// is the artifact handoff: user reviews `agent/...` branch with their
+	// own tools, no fetch/push hops required.
+	branches := runGitOutput(t, sourcePath, "branch", "--list", result.BranchName)
+	if !strings.Contains(branches, result.BranchName) {
+		t.Fatalf("branch %q missing from user repo %s; `git branch` returned: %s",
+			result.BranchName, sourcePath, strings.TrimSpace(branches))
+	}
+
+	// The worktree's git common-dir must point back at the user's repo,
+	// not at any cache. Anything else would mean we accidentally cloned.
+	// Resolve symlinks before comparing — macOS routes /var/folders/... to
+	// /private/var/folders/..., and `git rev-parse` emits the realpath while
+	// t.TempDir() returns the symlinked form. A naive string compare would
+	// flag a passing run as a regression.
+	commonDir := strings.TrimSpace(runGitOutput(t, result.Path, "rev-parse", "--git-common-dir"))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(result.Path, commonDir)
+	}
+	wantCommon := filepath.Join(sourcePath, ".git")
+	gotResolved := mustEvalSymlinks(t, commonDir)
+	wantResolved := mustEvalSymlinks(t, wantCommon)
+	if gotResolved != wantResolved {
+		t.Errorf("worktree git-common-dir = %q, want %q", gotResolved, wantResolved)
+	}
+}
+
+func mustEvalSymlinks(t *testing.T, p string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", p, err)
+	}
+	return resolved
+}
+
+// runGitOutput executes git -C dir args... and returns combined stdout,
+// failing the test on error. Used by tests that need to read git state
+// the daemon mutated indirectly.
+func runGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	full := append([]string{"-C", dir}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s failed: %s: %v", args, dir, strings.TrimSpace(string(out)), err)
+	}
+	return string(out)
+}
+
+// TestCreateWorktreeForFileURLRespectsCurrentHEAD verifies the local-repo
+// base-ref resolver: when the user has a non-default branch checked out,
+// the agent's new branch must be created off that branch (the user's
+// working state), not silently rerouted to refs/heads/main behind their
+// back. This is the property that makes the local mode feel like
+// "Claude Code on my current branch".
+func TestCreateWorktreeForFileURLRespectsCurrentHEAD(t *testing.T) {
+	t.Parallel()
+	sourcePath := createTestRepo(t)
+	// Switch the source repo onto a feature branch with a commit unique to it.
+	runGitAuthored(t, sourcePath, "checkout", "-b", "feat/local-agent")
+	if err := os.WriteFile(filepath.Join(sourcePath, "feature.txt"), []byte("on feat\n"), 0o644); err != nil {
+		t.Fatalf("write feature.txt: %v", err)
+	}
+	runGitAuthored(t, sourcePath, "add", ".")
+	runGitAuthored(t, sourcePath, "commit", "-m", "feature commit")
+
+	fileURL := "file://" + sourcePath
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-local", []RepoInfo{{URL: fileURL}}); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	result, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID: "ws-local",
+		RepoURL:     fileURL,
+		WorkDir:     t.TempDir(),
+		AgentName:   "local-agent",
+		TaskID:      "feat-resolve-test",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	// The new branch should contain the feature commit — proving it was
+	// based on feat/local-agent, not on master/main.
+	if _, err := os.Stat(filepath.Join(result.Path, "feature.txt")); err != nil {
+		t.Fatalf("worktree should contain feature.txt from user's checked-out branch: %v", err)
+	}
+}
+
+// TestCreateWorktreeForFileURLLeavesUserHooksAlone verifies that creating a
+// worktree off the user's local repo does NOT install daemon-owned hooks
+// in the user's own .git/hooks dir. The Co-authored-by hook (or any other
+// daemon-installed hook) is fine in an isolated bare cache the daemon owns
+// outright, but the user's repo is not the daemon's to mutate.
+func TestCreateWorktreeForFileURLLeavesUserHooksAlone(t *testing.T) {
+	t.Parallel()
+	sourcePath := createTestRepo(t)
+	fileURL := "file://" + sourcePath
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-local", []RepoInfo{{URL: fileURL}}); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	_, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID:         "ws-local",
+		RepoURL:             fileURL,
+		WorkDir:             t.TempDir(),
+		AgentName:           "local-agent",
+		TaskID:              "hook-isolation-test",
+		CoAuthoredByEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	hookPath := filepath.Join(sourcePath, ".git", "hooks", "prepare-commit-msg")
+	if _, err := os.Stat(hookPath); err == nil {
+		t.Fatalf("daemon installed a hook in user's repo at %s — must skip for file:// URLs", hookPath)
+	}
+}
+
+// TestSyncRejectsNonGitFileURL verifies that pointing a file:// URL at a
+// directory that isn't a git repository fails Sync explicitly, instead of
+// silently succeeding and then failing later inside `git worktree add`
+// with a confusing message.
+func TestSyncRejectsNonGitFileURL(t *testing.T) {
+	t.Parallel()
+	notARepo := t.TempDir()
+	cache := New(t.TempDir(), testLogger())
+	err := cache.Sync("ws-local", []RepoInfo{{URL: "file://" + notARepo}})
+	if err == nil {
+		t.Fatal("expected Sync to fail for non-git directory")
+	}
+	if !strings.Contains(err.Error(), "not a git repository") {
+		t.Errorf("expected 'not a git repository' in error, got: %v", err)
+	}
+}
+
 // TestSyncKeepsDistinctCachesForSegmentBoundaryColliders proves that two
 // URLs differing only at a path-segment boundary don't share a bare cache
 // and don't silently reuse each other's origin. Both conditions would have
