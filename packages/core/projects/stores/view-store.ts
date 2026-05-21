@@ -15,7 +15,7 @@ export interface ProjectViewState {
 export const useProjectViewStore = create<ProjectViewState>()(
   persist(
     (set) => ({
-      viewMode: "comfortable",
+      viewMode: "compact",
       setViewMode: (mode) => set({ viewMode: mode }),
     }),
     {
@@ -23,7 +23,7 @@ export const useProjectViewStore = create<ProjectViewState>()(
       storage: createJSONStorage(() => createWorkspaceAwareStorage(defaultStorage)),
       partialize: (state) => ({ viewMode: state.viewMode }),
       merge: (persisted, current) => {
-        if (!persisted) return { ...current, viewMode: "comfortable" };
+        if (!persisted) return { ...current, viewMode: "compact" };
         return { ...current, ...(persisted as Partial<ProjectViewState>) };
       },
     }

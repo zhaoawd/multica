@@ -26,7 +26,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   localStorage.clear();
-  useProjectViewStore.setState({ viewMode: "comfortable" });
+  useProjectViewStore.setState({ viewMode: "compact" });
   setCurrentWorkspace(null, null);
 });
 
@@ -35,62 +35,62 @@ afterEach(() => {
 });
 
 describe("useProjectViewStore", () => {
-  it("defaults to 'comfortable'", () => {
-    expect(useProjectViewStore.getState().viewMode).toBe("comfortable");
+  it("defaults to 'compact'", () => {
+    expect(useProjectViewStore.getState().viewMode).toBe("compact");
   });
 
   it("setViewMode mutates the store", () => {
-    useProjectViewStore.getState().setViewMode("compact");
-    expect(useProjectViewStore.getState().viewMode).toBe("compact");
+    useProjectViewStore.getState().setViewMode("comfortable");
+    expect(useProjectViewStore.getState().viewMode).toBe("comfortable");
   });
 
   it("partialize persists only viewMode under the workspace-namespaced key", async () => {
     setCurrentWorkspace("acme", "ws_a");
     await flush();
-    useProjectViewStore.getState().setViewMode("compact");
+    useProjectViewStore.getState().setViewMode("comfortable");
 
     const raw = localStorage.getItem("multica_projects_view:acme");
     expect(raw).not.toBeNull();
     const parsed = JSON.parse(raw as string);
-    expect(parsed.state).toEqual({ viewMode: "compact" });
+    expect(parsed.state).toEqual({ viewMode: "comfortable" });
   });
 
   it("rehydrates a different saved viewMode on workspace switch", async () => {
     localStorage.setItem(
       "multica_projects_view:acme",
-      JSON.stringify({ state: { viewMode: "compact" }, version: 0 }),
+      JSON.stringify({ state: { viewMode: "comfortable" }, version: 0 }),
     );
     localStorage.setItem(
       "multica_projects_view:beta",
+      JSON.stringify({ state: { viewMode: "compact" }, version: 0 }),
+    );
+
+    setCurrentWorkspace("acme", "ws_a");
+    await flush();
+    await flush();
+    expect(useProjectViewStore.getState().viewMode).toBe("comfortable");
+
+    setCurrentWorkspace("beta", "ws_b");
+    await flush();
+    await flush();
+    expect(useProjectViewStore.getState().viewMode).toBe("compact");
+  });
+
+  it("resets to 'compact' when switching to a workspace with no persisted value", async () => {
+    localStorage.setItem(
+      "multica_projects_view:acme",
       JSON.stringify({ state: { viewMode: "comfortable" }, version: 0 }),
     );
 
     setCurrentWorkspace("acme", "ws_a");
     await flush();
     await flush();
-    expect(useProjectViewStore.getState().viewMode).toBe("compact");
+    expect(useProjectViewStore.getState().viewMode).toBe("comfortable");
 
     setCurrentWorkspace("beta", "ws_b");
     await flush();
     await flush();
-    expect(useProjectViewStore.getState().viewMode).toBe("comfortable");
-  });
-
-  it("resets to 'comfortable' when switching to a workspace with no persisted value", async () => {
-    localStorage.setItem(
-      "multica_projects_view:acme",
-      JSON.stringify({ state: { viewMode: "compact" }, version: 0 }),
-    );
-
-    setCurrentWorkspace("acme", "ws_a");
-    await flush();
-    await flush();
     expect(useProjectViewStore.getState().viewMode).toBe("compact");
-
-    setCurrentWorkspace("beta", "ws_b");
-    await flush();
-    await flush();
-    expect(useProjectViewStore.getState().viewMode).toBe("comfortable");
     expect(localStorage.getItem("multica_projects_view:acme")).not.toBeNull();
   });
 });
