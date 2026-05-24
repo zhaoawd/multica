@@ -1,0 +1,334 @@
+# Lark routing decision matrix — golden file for §14.3.
+#
+# This file is the design-intent contract for service.RouteLarkEvent.
+# It enumerates every supported event × condition × user_pref combo
+# the router must handle. A regression that flips a case here is
+# loudly visible in PR diffs — the whole point.
+#
+# Editing rules:
+#   - Every row in service.SupportedLarkEvents must have at least
+#     one case below.
+#   - Every case must list both expected.channels AND
+#     expected.must_not_channels. The negative space catches
+#     "right route picked, wrong fan-out alongside it" bugs.
+#   - Adding events or cases is itself a golden diff — that's the
+#     review surface, do not bypass.
+#   - The decision function is referentially transparent. Cases that
+#     depend on user_pref must set every field that participates in
+#     the branch (default-empty pref means "all OFF").
+#
+# Field reference (matches LarkRoutingConditions yaml tags):
+#   event:                multica event kind ("issue:created", ...)
+#   has_assignee:         issue has a non-empty assignee_id
+#   has_lark_issue_link:  issue came from a Lark thread
+#   assignee_changed:     applies to issue:updated only
+#   comment_type:         applies to comment:created only
+#   has_mention:          comment text references a member/agent/squad/@all
+#   user_pref:            LarkUserPref snapshot (see lark_routing.go)
+
+cases:
+  # ── issue:created ────────────────────────────────────────────────
+  - name: issue_created_no_assignee_no_thread
+    conditions:
+      event: issue:created
+      has_assignee: false
+      has_lark_issue_link: false
+    expected:
+      channels: [team]
+      card: claim_card
+      must_not_channels: [dm, thread_reply]
+
+  - name: issue_created_no_assignee_with_thread
+    conditions:
+      event: issue:created
+      has_assignee: false
+      has_lark_issue_link: true
+    expected:
+      channels: [thread_reply]
+      card: created_confirmation
+      must_not_channels: [team, dm]
+
+  - name: issue_created_with_assignee_no_thread
+    conditions:
+      event: issue:created
+      has_assignee: true
+      has_lark_issue_link: false
+    expected:
+      channels: [dm]
+      card: assigned_card
+      must_not_channels: [team, thread_reply]
+
+  - name: issue_created_with_assignee_with_thread
+    # Both anchors apply: thread gets the creation confirmation,
+    # assignee gets a personal card. Team chat is explicitly out.
+    conditions:
+      event: issue:created
+      has_assignee: true
+      has_lark_issue_link: true
+    expected:
+      channels: [dm, thread_reply]
+      card: created_confirmation
+      must_not_channels: [team]
+
+  # ── issue:updated ────────────────────────────────────────────────
+  - name: issue_updated_assignee_changed
+    conditions:
+      event: issue:updated
+      assignee_changed: true
+      has_assignee: true
+    expected:
+      channels: [dm]
+      card: assigned_card
+      must_not_channels: [team, thread_reply]
+
+  - name: issue_updated_assignee_changed_to_unassigned
+    # Unassignment (assignee_changed=true, has_assignee=false) is
+    # silent — there's no one to DM, and §6.1 keeps assignment
+    # signals out of the team chat by default.
+    conditions:
+      event: issue:updated
+      assignee_changed: true
+      has_assignee: false
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  - name: issue_updated_no_assignee_change
+    # Priority / status / due-date updates default silent (§6.1).
+    conditions:
+      event: issue:updated
+      assignee_changed: false
+      has_assignee: true
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  # ── task:completed ───────────────────────────────────────────────
+  - name: task_completed_pref_off
+    # Default OFF: most users won't see the card unless they opt in.
+    conditions:
+      event: task:completed
+      has_assignee: true
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  - name: task_completed_pref_on
+    conditions:
+      event: task:completed
+      has_assignee: true
+      user_pref:
+        task_completed_dm: true
+    expected:
+      channels: [dm]
+      card: task_completed
+      must_not_channels: [team, thread_reply]
+
+  # ── task:failed ──────────────────────────────────────────────────
+  - name: task_failed_public_blocker
+    # No assignee + failed = public blocker → team. The ONLY path
+    # that promotes a task failure into the team chat.
+    conditions:
+      event: task:failed
+      has_assignee: false
+    expected:
+      channels: [team]
+      card: public_blocker
+      must_not_channels: [dm, thread_reply]
+
+  - name: task_failed_with_assignee_pref_off
+    # Default OFF: a task with an assignee fails silently from
+    # Lark's perspective; daemon auto-retries handle most cases.
+    conditions:
+      event: task:failed
+      has_assignee: true
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  - name: task_failed_with_assignee_pref_on
+    conditions:
+      event: task:failed
+      has_assignee: true
+      user_pref:
+        task_failed_dm: true
+    expected:
+      channels: [dm]
+      card: task_failed_personal
+      must_not_channels: [team, thread_reply]
+
+  # ── comment:created (clarification) ──────────────────────────────
+  - name: comment_clarification_with_thread
+    conditions:
+      event: comment:created
+      comment_type: clarification
+      has_assignee: true
+      has_lark_issue_link: true
+    expected:
+      channels: [thread_reply]
+      card: clarification
+      must_not_channels: [team, dm]
+
+  - name: comment_clarification_no_thread_pref_on
+    # Default ON — AgentClarificationDM is one of the two prefs
+    # OAuth turns on by default (§6.1).
+    conditions:
+      event: comment:created
+      comment_type: clarification
+      has_assignee: true
+      has_lark_issue_link: false
+      user_pref:
+        agent_clarification_dm: true
+    expected:
+      channels: [dm]
+      card: clarification
+      must_not_channels: [team, thread_reply]
+
+  - name: comment_clarification_no_thread_pref_off
+    # An explicit opt-out silences the bridge even when the default
+    # would have surfaced it. Used by users who'd rather see
+    # agent questions only in the multica UI.
+    conditions:
+      event: comment:created
+      comment_type: clarification
+      has_assignee: true
+      has_lark_issue_link: false
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  # ── comment:created (regular) ────────────────────────────────────
+  - name: comment_regular_mention_pref_off
+    # Default OFF: mentions go to the multica inbox, not Lark DM.
+    conditions:
+      event: comment:created
+      comment_type: comment
+      has_mention: true
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  - name: comment_regular_mention_pref_on
+    conditions:
+      event: comment:created
+      comment_type: comment
+      has_mention: true
+      user_pref:
+        mention_dm: true
+    expected:
+      channels: [dm]
+      card: comment_mention
+      must_not_channels: [team, thread_reply]
+
+  - name: comment_regular_no_mention
+    # Comments without an @-target never produce a card.
+    conditions:
+      event: comment:created
+      comment_type: comment
+      has_mention: false
+      user_pref:
+        mention_dm: true
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  # ── task:dispatch (§14.1.1 placeholder) ──────────────────────────
+  # Streaming patch events require has_active_lark_message_ref. Without
+  # it there is no card to patch and the route is silent — the
+  # *_proposed comment is what opens the card, dispatch only mutates it.
+
+  - name: task_dispatch_with_thread_with_active_ref
+    conditions:
+      event: task:dispatch
+      has_lark_issue_link: true
+      has_assignee: true
+      has_active_lark_message_ref: true
+    expected:
+      channels: [thread_reply]
+      must_not_channels: [team, dm]
+
+  - name: task_dispatch_with_thread_no_active_ref
+    # Has a thread but no card was opened yet — silent.
+    conditions:
+      event: task:dispatch
+      has_lark_issue_link: true
+      has_assignee: true
+      has_active_lark_message_ref: false
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  - name: task_dispatch_no_thread_with_assignee_with_active_ref
+    conditions:
+      event: task:dispatch
+      has_lark_issue_link: false
+      has_assignee: true
+      has_active_lark_message_ref: true
+    expected:
+      channels: [dm]
+      must_not_channels: [team, thread_reply]
+
+  - name: task_dispatch_no_thread_with_assignee_no_active_ref
+    # The DM card likewise needs an existing message ref. Without it,
+    # routing this would push every routine task execution into the
+    # assignee's DM — exactly the regression P2 guards against.
+    conditions:
+      event: task:dispatch
+      has_lark_issue_link: false
+      has_assignee: true
+      has_active_lark_message_ref: false
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  - name: task_dispatch_no_thread_no_assignee
+    # No anchor → no placeholder card to open. The streaming patch
+    # has nothing to patch later, so the dispatch event is silent.
+    conditions:
+      event: task:dispatch
+      has_lark_issue_link: false
+      has_assignee: false
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  # ── task:progress (§14.1.1 patch) ────────────────────────────────
+  - name: task_progress_with_thread_with_active_ref
+    conditions:
+      event: task:progress
+      has_lark_issue_link: true
+      has_assignee: true
+      has_active_lark_message_ref: true
+    expected:
+      channels: [thread_reply]
+      must_not_channels: [team, dm]
+
+  - name: task_progress_with_thread_no_active_ref
+    conditions:
+      event: task:progress
+      has_lark_issue_link: true
+      has_assignee: true
+      has_active_lark_message_ref: false
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
+
+  - name: task_progress_no_thread_with_assignee_with_active_ref
+    conditions:
+      event: task:progress
+      has_lark_issue_link: false
+      has_assignee: true
+      has_active_lark_message_ref: true
+    expected:
+      channels: [dm]
+      must_not_channels: [team, thread_reply]
+
+  - name: task_progress_no_thread_with_assignee_no_active_ref
+    conditions:
+      event: task:progress
+      has_lark_issue_link: false
+      has_assignee: true
+      has_active_lark_message_ref: false
+    expected:
+      channels: []
+      must_not_channels: [team, dm, thread_reply]
