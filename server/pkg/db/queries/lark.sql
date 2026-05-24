@@ -37,6 +37,15 @@ RETURNING *;
 -- name: DeleteLarkWorkspaceBinding :exec
 DELETE FROM lark_workspace_binding WHERE workspace_id = $1;
 
+-- name: MarkLarkBindingPermWarning :exec
+-- Stamps last_perm_warning_at = now() for the workspace. Called once
+-- per binding after the §14.1.3 "missing im:resource scope" bot reply
+-- has been posted into the thread; the renderer reads the column to
+-- avoid re-posting on every subsequent attachment failure.
+UPDATE lark_workspace_binding
+SET last_perm_warning_at = now()
+WHERE workspace_id = $1;
+
 -- =====================
 -- Lark user link
 -- =====================

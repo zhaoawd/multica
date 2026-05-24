@@ -185,6 +185,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// fetch + reply paths. Safe to construct even when Lark is
 	// unconfigured — the service short-circuits to "unavailable".
 	h.LarkThread = service.NewLarkThreadService(queries, pool, bus, larkClient)
+	// §14.1.3 thread media → attachment: shares the LarkClient with
+	// thread/docs so a single tenant_access_token cache serves every
+	// outbound API call. Storage can be nil in tests; the service
+	// treats nil Storage as "unavailable" and the @bot path skips
+	// media downloads gracefully.
+	h.LarkMedia = service.NewLarkMediaService(queries, larkClient, h.Storage)
 	// P5 outbound bridge: subscribe agent-authored comments to the thread
 	// mirror so clarification questions appear in the originating Lark
 	// thread. Registered here (not in main.go alongside the notifier)

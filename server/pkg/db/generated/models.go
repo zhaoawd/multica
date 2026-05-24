@@ -111,6 +111,8 @@ type Attachment struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	ChatSessionID pgtype.UUID        `json:"chat_session_id"`
 	ChatMessageID pgtype.UUID        `json:"chat_message_id"`
+	ContentSha256 pgtype.Text        `json:"content_sha256"`
+	Source        pgtype.Text        `json:"source"`
 }
 
 type Autopilot struct {
@@ -397,12 +399,13 @@ type LarkUserLink struct {
 }
 
 type LarkWorkspaceBinding struct {
-	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
-	ChatID        string             `json:"chat_id"`
-	BotTokenEnc   []byte             `json:"bot_token_enc"`
-	EnabledEvents []string           `json:"enabled_events"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	ChatID            string             `json:"chat_id"`
+	BotTokenEnc       []byte             `json:"bot_token_enc"`
+	EnabledEvents     []string           `json:"enabled_events"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	LastPermWarningAt pgtype.Timestamptz `json:"last_perm_warning_at"`
 }
 
 type Member struct {

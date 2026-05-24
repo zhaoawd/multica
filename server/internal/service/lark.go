@@ -236,11 +236,39 @@ func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, car
 // embeds text messages as `{"text":"..."}` in `content`). For non-text
 // messages (image, file, sticker, ...) Text is the empty string —
 // callers either skip the message or render a placeholder.
+//
+// Attachments enumerates the binary payloads referenced by image / file
+// messages. The §14.1.3 thread-media bridge downloads these via
+// DownloadMessageResource and attaches them to the new issue. Text-
+// only messages have Attachments == nil.
 type LarkThreadMessage struct {
 	MessageID    string
 	SenderOpenID string
 	CreatedAt    time.Time
 	Text         string
+	Attachments  []LarkMessageAttachment
+}
+
+// LarkMessageAttachment is the metadata needed to download one binary
+// payload attached to a Lark message. ResourceType is the value of
+// Lark's `?type=` query parameter on the resources endpoint —
+// "image" for image messages, "file" for file/media messages.
+//
+// Filename is best-effort: image messages don't carry a user-friendly
+// name (Lark generates one), file messages do. The downloader
+// substitutes a fallback when Filename is empty so the issue
+// attachment list still has something to display.
+//
+// SizeHint comes from the message envelope where Lark provides it
+// (file messages). For image messages it's zero and the size is
+// only known after the download completes. The downloader uses
+// SizeHint > 0 to short-circuit before the HTTP body is fetched.
+type LarkMessageAttachment struct {
+	FileKey      string
+	ResourceType string // "image" | "file"
+	Filename     string
+	MimeType     string
+	SizeHint     int64
 }
 
 // ReplyToMessage posts a text reply to a previously-sent Lark message.
@@ -300,6 +328,235 @@ func (c *LarkClient) ReplyToMessage(ctx context.Context, messageID, text string)
 		return fmt.Errorf("lark reply: code=%d msg=%s", out.Code, out.Msg)
 	}
 	return nil
+}
+
+// SendTextMessage posts a plain-text message to a recipient identified
+// by `receiveIDType` (the value of Lark's `receive_id_type` query
+// parameter — `chat_id`, `open_id`, `union_id`, `user_id`, or `email`)
+// and `receiveID` of the matching kind.
+//
+// Used by §14.1.2's `/whoami` DM fan-out (receive_id_type=open_id) and
+// any future "send by user id" path. For chat_id sends we still prefer
+// SendInteractiveCard so the rich card surface stays — this is for
+// short, line-oriented text where the recipient hint is a user, not
+// a chat.
+//
+// Errors propagate verbatim; callers decide whether to log-and-drop
+// (best-effort) or surface (interactive). Validation: empty inputs
+// fail fast so a misconfigured caller can't trigger a Lark 400 with
+// useful detail buried under several layers of HTTP plumbing.
+func (c *LarkClient) SendTextMessage(ctx context.Context, receiveIDType, receiveID, text string) error {
+	if !c.cfg.Configured() {
+		return errors.New("lark not configured")
+	}
+	if receiveIDType == "" {
+		return errors.New("receive_id_type required")
+	}
+	if receiveID == "" {
+		return errors.New("receive_id required")
+	}
+	contentBytes, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return err
+	}
+	payload := map[string]string{
+		"receive_id": receiveID,
+		"msg_type":   "text",
+		"content":    string(contentBytes),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	token, err := c.tenantAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	endpoint := c.apiBase + "/im/v1/messages?receive_id_type=" + receiveIDType
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return fmt.Errorf("lark send text: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("lark send text: code=%d msg=%s", out.Code, out.Msg)
+	}
+	return nil
+}
+
+// LarkResourceErrKind categorises why a DownloadMessageResource call
+// failed, so callers can map to the right §14.1.3 placeholder line
+// without grepping the raw error string:
+//
+//   - PermissionDenied: Lark returned 401/403 OR an im:resource-scope
+//     error code. Triggers the "ask admin to grant im:resource" bot
+//     reply (throttled via lark_workspace_binding.last_perm_warning_at).
+//   - NotFound: Lark returned 404. Renders as
+//     "[attachment unavailable: <filename>]" in the issue body.
+//   - TooLarge: caller-supplied maxBytes exceeded mid-stream. We do NOT
+//     read the rest of the body — the limited reader short-circuits at
+//     maxBytes+1. Caller maps this to "oversized" so the user sees a
+//     clean placeholder instead of a generic "unavailable".
+//   - Other: every other failure (network, malformed response, etc.).
+//     Same surface as NotFound — degraded but doesn't escalate to a
+//     thread reply.
+type LarkResourceErrKind int
+
+const (
+	LarkResourceErrNone LarkResourceErrKind = iota
+	LarkResourceErrPermissionDenied
+	LarkResourceErrNotFound
+	LarkResourceErrTooLarge
+	LarkResourceErrOther
+)
+
+// LarkResourceError wraps the categorised kind with the underlying
+// detail. Returned by DownloadMessageResource on every non-2xx
+// outcome; callers should classify via .Kind, not the wrapped error.
+type LarkResourceError struct {
+	Kind LarkResourceErrKind
+	Err  error
+}
+
+func (e *LarkResourceError) Error() string {
+	if e == nil || e.Err == nil {
+		return "lark resource error"
+	}
+	return e.Err.Error()
+}
+
+// LarkResourceDownloadCap is the byte ceiling enforced inside the
+// client when the caller passes maxBytes<=0. Above this we abort the
+// read and return ErrTooLarge so the server doesn't buffer a multi-GB
+// blob into memory just because a user attached one to a Lark thread.
+// §14.1.3 enforces a tighter 10 MB per-file cap at the media-service
+// layer; passing the tighter limit via maxBytes ensures images with
+// no envelope size hint cannot burn the full 64 MB before being
+// rejected post-download.
+const LarkResourceDownloadCap = 64 * 1024 * 1024 // 64 MB
+
+// DownloadMessageResource fetches one binary attached to a Lark
+// message. The endpoint is `/im/v1/messages/{message_id}/resources/{file_key}?type=image|file`.
+//
+// maxBytes bounds the read; pass 0 to use LarkResourceDownloadCap.
+// When the resource exceeds the effective limit, the returned error
+// is LarkResourceErrTooLarge — callers should map that to "oversized"
+// (or "limit_exhausted" if the caller's effective max was a remaining
+// budget) rather than generic unavailable.
+//
+// Returns the body bytes and the server-reported Content-Type. Both
+// are useful: the body is what we upload to multica storage, and the
+// Content-Type is the authoritative mime for image messages (the
+// list endpoint doesn't disclose the subtype).
+func (c *LarkClient) DownloadMessageResource(ctx context.Context, messageID, fileKey, resourceType string, maxBytes int64) ([]byte, string, *LarkResourceError) {
+	if !c.cfg.Configured() {
+		return nil, "", &LarkResourceError{Kind: LarkResourceErrOther, Err: errors.New("lark not configured")}
+	}
+	if messageID == "" || fileKey == "" {
+		return nil, "", &LarkResourceError{Kind: LarkResourceErrOther, Err: errors.New("message_id and file_key required")}
+	}
+	if resourceType == "" {
+		resourceType = "image"
+	}
+
+	token, err := c.tenantAccessToken(ctx)
+	if err != nil {
+		return nil, "", &LarkResourceError{Kind: LarkResourceErrOther, Err: err}
+	}
+	q := url.Values{}
+	q.Set("type", resourceType)
+	endpoint := fmt.Sprintf("%s/im/v1/messages/%s/resources/%s?%s",
+		c.apiBase, messageID, fileKey, q.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, "", &LarkResourceError{Kind: LarkResourceErrOther, Err: err}
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, "", &LarkResourceError{Kind: LarkResourceErrOther, Err: err}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, "", &LarkResourceError{
+			Kind: LarkResourceErrPermissionDenied,
+			Err:  fmt.Errorf("lark resource: %d", resp.StatusCode),
+		}
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, "", &LarkResourceError{Kind: LarkResourceErrNotFound, Err: errors.New("not found")}
+	}
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		// Lark wraps API-level errors as JSON even on the resource
+		// endpoint when the request itself is malformed. Code 99991663
+		// (and the surrounding family) means "missing im:resource
+		// scope" — surface that as PermissionDenied so the caller can
+		// ask the admin to grant the scope rather than retrying.
+		var apiErr struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+		}
+		if json.Unmarshal(raw, &apiErr) == nil && apiErr.Code != 0 {
+			if isLarkPermissionCode(apiErr.Code) {
+				return nil, "", &LarkResourceError{
+					Kind: LarkResourceErrPermissionDenied,
+					Err:  fmt.Errorf("lark resource: code=%d msg=%s", apiErr.Code, apiErr.Msg),
+				}
+			}
+		}
+		return nil, "", &LarkResourceError{
+			Kind: LarkResourceErrOther,
+			Err:  fmt.Errorf("lark resource: status=%d body=%s", resp.StatusCode, string(raw)),
+		}
+	}
+
+	limit := maxBytes
+	if limit <= 0 || limit > LarkResourceDownloadCap {
+		limit = LarkResourceDownloadCap
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if readErr != nil {
+		return nil, "", &LarkResourceError{Kind: LarkResourceErrOther, Err: readErr}
+	}
+	if int64(len(body)) > limit {
+		return nil, "", &LarkResourceError{
+			Kind: LarkResourceErrTooLarge,
+			Err:  fmt.Errorf("resource body exceeds %d bytes", limit),
+		}
+	}
+	return body, resp.Header.Get("Content-Type"), nil
+}
+
+// isLarkPermissionCode returns true for Lark API codes that mean
+// "missing scope" or "no permission". The exact codes are documented
+// in Lark's open API errata; we list the ones we've actually seen
+// here and treat unknown 99xx codes optimistically as "other" so a
+// future code addition degrades silently rather than incorrectly
+// posting a permission-warning bot reply.
+func isLarkPermissionCode(code int) bool {
+	switch code {
+	case 99991663, // im:resource scope missing
+		99991661, // im:message scope missing
+		99991668: // permission denied (generic)
+		return true
+	}
+	return false
 }
 
 // ListThreadMessages returns up to `limit` messages from a Lark thread,
@@ -370,27 +627,80 @@ func (c *LarkClient) ListThreadMessages(ctx context.Context, threadID string, li
 
 	msgs := make([]LarkThreadMessage, 0, len(out.Data.Items))
 	for _, item := range out.Data.Items {
-		// Lark text messages embed the visible body as JSON
-		// `{"text":"..."}` in body.content. Other msg_types (post, image,
-		// file, sticker, ...) come through here too but with no
-		// human-readable text we can pull cleanly — skip them.
-		text := ""
-		if item.MsgType == "text" && item.Body.Content != "" {
-			var inner struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal([]byte(item.Body.Content), &inner); err == nil {
-				text = inner.Text
-			}
-		}
+		text, atts := parseLarkMessageBody(item.MsgType, item.Body.Content)
 		msgs = append(msgs, LarkThreadMessage{
 			MessageID:    item.MessageID,
 			SenderOpenID: item.Sender.ID,
 			CreatedAt:    parseLarkCreateTime(item.CreateTime),
 			Text:         text,
+			Attachments:  atts,
 		})
 	}
 	return msgs, nil
+}
+
+// parseLarkMessageBody unpacks one message envelope into a (text,
+// attachments) pair. Each msg_type Lark sends has a different content
+// shape; we only decode the ones the §6.5 thread → issue flow knows
+// how to handle:
+//
+//   text   — body.content is `{"text":"..."}`. No attachments.
+//   image  — body.content is `{"image_key":"img_..."}`. Single
+//            attachment; mime is image/* (Lark doesn't disclose the
+//            exact subtype on the list endpoint, so we leave MimeType
+//            empty and let the downloader read it from Content-Type).
+//   file / media — body.content is `{"file_key":"file_...",
+//            "file_name":"...", "file_size":..., "type":"pdf"}`.
+//            type hints the extension; size is a hint, not authoritative.
+//
+// Unknown msg_types (post, sticker, audio, ...) produce empty text and
+// nil attachments — the message still appears in the transcript via
+// MessageID but the body is not lifted into the issue.
+func parseLarkMessageBody(msgType, content string) (string, []LarkMessageAttachment) {
+	if content == "" {
+		return "", nil
+	}
+	switch msgType {
+	case "text":
+		var inner struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(content), &inner); err == nil {
+			return inner.Text, nil
+		}
+		return "", nil
+
+	case "image":
+		var inner struct {
+			ImageKey string `json:"image_key"`
+		}
+		if err := json.Unmarshal([]byte(content), &inner); err != nil || inner.ImageKey == "" {
+			return "", nil
+		}
+		return "", []LarkMessageAttachment{{
+			FileKey:      inner.ImageKey,
+			ResourceType: "image",
+		}}
+
+	case "file", "media":
+		var inner struct {
+			FileKey  string `json:"file_key"`
+			FileName string `json:"file_name"`
+			FileSize int64  `json:"file_size"`
+			MimeType string `json:"mime_type"`
+		}
+		if err := json.Unmarshal([]byte(content), &inner); err != nil || inner.FileKey == "" {
+			return "", nil
+		}
+		return "", []LarkMessageAttachment{{
+			FileKey:      inner.FileKey,
+			ResourceType: "file",
+			Filename:     inner.FileName,
+			MimeType:     inner.MimeType,
+			SizeHint:     inner.FileSize,
+		}}
+	}
+	return "", nil
 }
 
 // parseLarkCreateTime decodes Lark's create_time string (epoch

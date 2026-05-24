@@ -14,13 +14,15 @@ import (
 const createAttachment = `-- name: CreateAttachment :one
 INSERT INTO attachment (
   id, workspace_id, issue_id, comment_id, chat_session_id,
-  uploader_type, uploader_id, filename, url, content_type, size_bytes
+  uploader_type, uploader_id, filename, url, content_type, size_bytes,
+  content_sha256, source
 )
 VALUES (
   $1, $2, $9, $10, $11,
-  $3, $4, $5, $6, $7, $8
+  $3, $4, $5, $6, $7, $8,
+  $12, $13
 )
-RETURNING id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id
+RETURNING id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source
 `
 
 type CreateAttachmentParams struct {
@@ -35,6 +37,8 @@ type CreateAttachmentParams struct {
 	IssueID       pgtype.UUID `json:"issue_id"`
 	CommentID     pgtype.UUID `json:"comment_id"`
 	ChatSessionID pgtype.UUID `json:"chat_session_id"`
+	ContentSha256 pgtype.Text `json:"content_sha256"`
+	Source        pgtype.Text `json:"source"`
 }
 
 func (q *Queries) CreateAttachment(ctx context.Context, arg CreateAttachmentParams) (Attachment, error) {
@@ -50,6 +54,8 @@ func (q *Queries) CreateAttachment(ctx context.Context, arg CreateAttachmentPara
 		arg.IssueID,
 		arg.CommentID,
 		arg.ChatSessionID,
+		arg.ContentSha256,
+		arg.Source,
 	)
 	var i Attachment
 	err := row.Scan(
@@ -66,6 +72,8 @@ func (q *Queries) CreateAttachment(ctx context.Context, arg CreateAttachmentPara
 		&i.CreatedAt,
 		&i.ChatSessionID,
 		&i.ChatMessageID,
+		&i.ContentSha256,
+		&i.Source,
 	)
 	return i, err
 }
@@ -84,8 +92,46 @@ func (q *Queries) DeleteAttachment(ctx context.Context, arg DeleteAttachmentPara
 	return err
 }
 
+const findAttachmentByContentSha256 = `-- name: FindAttachmentByContentSha256 :one
+SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source FROM attachment
+WHERE workspace_id = $1 AND content_sha256 = $2
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+type FindAttachmentByContentSha256Params struct {
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	ContentSha256 pgtype.Text `json:"content_sha256"`
+}
+
+// Workspace-scoped dedup lookup for §14.1.3. Returns the most-recently-
+// created attachment with this hash, so the bridge can reuse its
+// storage URL instead of re-uploading the same blob.
+func (q *Queries) FindAttachmentByContentSha256(ctx context.Context, arg FindAttachmentByContentSha256Params) (Attachment, error) {
+	row := q.db.QueryRow(ctx, findAttachmentByContentSha256, arg.WorkspaceID, arg.ContentSha256)
+	var i Attachment
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.CommentID,
+		&i.UploaderType,
+		&i.UploaderID,
+		&i.Filename,
+		&i.Url,
+		&i.ContentType,
+		&i.SizeBytes,
+		&i.CreatedAt,
+		&i.ChatSessionID,
+		&i.ChatMessageID,
+		&i.ContentSha256,
+		&i.Source,
+	)
+	return i, err
+}
+
 const getAttachment = `-- name: GetAttachment :one
-SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id FROM attachment
+SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source FROM attachment
 WHERE id = $1 AND workspace_id = $2
 `
 
@@ -111,6 +157,8 @@ func (q *Queries) GetAttachment(ctx context.Context, arg GetAttachmentParams) (A
 		&i.CreatedAt,
 		&i.ChatSessionID,
 		&i.ChatMessageID,
+		&i.ContentSha256,
+		&i.Source,
 	)
 	return i, err
 }
@@ -224,7 +272,7 @@ func (q *Queries) ListAttachmentURLsByIssueOrComments(ctx context.Context, issue
 }
 
 const listAttachmentsByChatMessage = `-- name: ListAttachmentsByChatMessage :many
-SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id FROM attachment
+SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source FROM attachment
 WHERE chat_message_id = $1 AND workspace_id = $2
 ORDER BY created_at ASC
 `
@@ -257,6 +305,8 @@ func (q *Queries) ListAttachmentsByChatMessage(ctx context.Context, arg ListAtta
 			&i.CreatedAt,
 			&i.ChatSessionID,
 			&i.ChatMessageID,
+			&i.ContentSha256,
+			&i.Source,
 		); err != nil {
 			return nil, err
 		}
@@ -269,7 +319,7 @@ func (q *Queries) ListAttachmentsByChatMessage(ctx context.Context, arg ListAtta
 }
 
 const listAttachmentsByChatMessageIDs = `-- name: ListAttachmentsByChatMessageIDs :many
-SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id FROM attachment
+SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source FROM attachment
 WHERE chat_message_id = ANY($1::uuid[]) AND workspace_id = $2
 ORDER BY created_at ASC
 `
@@ -302,6 +352,8 @@ func (q *Queries) ListAttachmentsByChatMessageIDs(ctx context.Context, arg ListA
 			&i.CreatedAt,
 			&i.ChatSessionID,
 			&i.ChatMessageID,
+			&i.ContentSha256,
+			&i.Source,
 		); err != nil {
 			return nil, err
 		}
@@ -314,7 +366,7 @@ func (q *Queries) ListAttachmentsByChatMessageIDs(ctx context.Context, arg ListA
 }
 
 const listAttachmentsByComment = `-- name: ListAttachmentsByComment :many
-SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id FROM attachment
+SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source FROM attachment
 WHERE comment_id = $1 AND workspace_id = $2
 ORDER BY created_at ASC
 `
@@ -347,6 +399,8 @@ func (q *Queries) ListAttachmentsByComment(ctx context.Context, arg ListAttachme
 			&i.CreatedAt,
 			&i.ChatSessionID,
 			&i.ChatMessageID,
+			&i.ContentSha256,
+			&i.Source,
 		); err != nil {
 			return nil, err
 		}
@@ -359,7 +413,7 @@ func (q *Queries) ListAttachmentsByComment(ctx context.Context, arg ListAttachme
 }
 
 const listAttachmentsByCommentIDs = `-- name: ListAttachmentsByCommentIDs :many
-SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id FROM attachment
+SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source FROM attachment
 WHERE comment_id = ANY($1::uuid[]) AND workspace_id = $2
 ORDER BY created_at ASC
 `
@@ -392,6 +446,8 @@ func (q *Queries) ListAttachmentsByCommentIDs(ctx context.Context, arg ListAttac
 			&i.CreatedAt,
 			&i.ChatSessionID,
 			&i.ChatMessageID,
+			&i.ContentSha256,
+			&i.Source,
 		); err != nil {
 			return nil, err
 		}
@@ -404,7 +460,7 @@ func (q *Queries) ListAttachmentsByCommentIDs(ctx context.Context, arg ListAttac
 }
 
 const listAttachmentsByIssue = `-- name: ListAttachmentsByIssue :many
-SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id FROM attachment
+SELECT id, workspace_id, issue_id, comment_id, uploader_type, uploader_id, filename, url, content_type, size_bytes, created_at, chat_session_id, chat_message_id, content_sha256, source FROM attachment
 WHERE issue_id = $1 AND workspace_id = $2
 ORDER BY created_at ASC
 `
@@ -437,6 +493,8 @@ func (q *Queries) ListAttachmentsByIssue(ctx context.Context, arg ListAttachment
 			&i.CreatedAt,
 			&i.ChatSessionID,
 			&i.ChatMessageID,
+			&i.ContentSha256,
+			&i.Source,
 		); err != nil {
 			return nil, err
 		}

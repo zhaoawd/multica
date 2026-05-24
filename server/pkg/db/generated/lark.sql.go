@@ -112,7 +112,7 @@ func (q *Queries) GetLarkUserLinkByOpenID(ctx context.Context, larkOpenID string
 
 const getLarkWorkspaceBinding = `-- name: GetLarkWorkspaceBinding :one
 
-SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at FROM lark_workspace_binding
+SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at, last_perm_warning_at FROM lark_workspace_binding
 WHERE workspace_id = $1
 `
 
@@ -129,12 +129,13 @@ func (q *Queries) GetLarkWorkspaceBinding(ctx context.Context, workspaceID pgtyp
 		&i.EnabledEvents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastPermWarningAt,
 	)
 	return i, err
 }
 
 const getLarkWorkspaceBindingByChatID = `-- name: GetLarkWorkspaceBindingByChatID :one
-SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at FROM lark_workspace_binding
+SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at, last_perm_warning_at FROM lark_workspace_binding
 WHERE chat_id = $1
 `
 
@@ -148,6 +149,7 @@ func (q *Queries) GetLarkWorkspaceBindingByChatID(ctx context.Context, chatID st
 		&i.EnabledEvents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastPermWarningAt,
 	)
 	return i, err
 }
@@ -187,7 +189,7 @@ func (q *Queries) InsertLarkIssueLink(ctx context.Context, arg InsertLarkIssueLi
 }
 
 const listLarkWorkspaceBindings = `-- name: ListLarkWorkspaceBindings :many
-SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at FROM lark_workspace_binding
+SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at, last_perm_warning_at FROM lark_workspace_binding
 ORDER BY created_at ASC
 `
 
@@ -207,6 +209,7 @@ func (q *Queries) ListLarkWorkspaceBindings(ctx context.Context) ([]LarkWorkspac
 			&i.EnabledEvents,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.LastPermWarningAt,
 		); err != nil {
 			return nil, err
 		}
@@ -218,12 +221,27 @@ func (q *Queries) ListLarkWorkspaceBindings(ctx context.Context) ([]LarkWorkspac
 	return items, nil
 }
 
+const markLarkBindingPermWarning = `-- name: MarkLarkBindingPermWarning :exec
+UPDATE lark_workspace_binding
+SET last_perm_warning_at = now()
+WHERE workspace_id = $1
+`
+
+// Stamps last_perm_warning_at = now() for the workspace. Called once
+// per binding after the §14.1.3 "missing im:resource scope" bot reply
+// has been posted into the thread; the renderer reads the column to
+// avoid re-posting on every subsequent attachment failure.
+func (q *Queries) MarkLarkBindingPermWarning(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, markLarkBindingPermWarning, workspaceID)
+	return err
+}
+
 const updateLarkWorkspaceBindingEvents = `-- name: UpdateLarkWorkspaceBindingEvents :one
 UPDATE lark_workspace_binding
 SET enabled_events = $2,
     updated_at = now()
 WHERE workspace_id = $1
-RETURNING workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at
+RETURNING workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at, last_perm_warning_at
 `
 
 type UpdateLarkWorkspaceBindingEventsParams struct {
@@ -241,6 +259,7 @@ func (q *Queries) UpdateLarkWorkspaceBindingEvents(ctx context.Context, arg Upda
 		&i.EnabledEvents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastPermWarningAt,
 	)
 	return i, err
 }
@@ -287,7 +306,7 @@ ON CONFLICT (workspace_id) DO UPDATE SET
     bot_token_enc  = EXCLUDED.bot_token_enc,
     enabled_events = EXCLUDED.enabled_events,
     updated_at     = now()
-RETURNING workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at
+RETURNING workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at, last_perm_warning_at
 `
 
 type UpsertLarkWorkspaceBindingParams struct {
@@ -312,6 +331,7 @@ func (q *Queries) UpsertLarkWorkspaceBinding(ctx context.Context, arg UpsertLark
 		&i.EnabledEvents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastPermWarningAt,
 	)
 	return i, err
 }

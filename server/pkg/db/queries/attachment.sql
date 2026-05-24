@@ -1,13 +1,24 @@
 -- name: CreateAttachment :one
 INSERT INTO attachment (
   id, workspace_id, issue_id, comment_id, chat_session_id,
-  uploader_type, uploader_id, filename, url, content_type, size_bytes
+  uploader_type, uploader_id, filename, url, content_type, size_bytes,
+  content_sha256, source
 )
 VALUES (
   $1, $2, sqlc.narg(issue_id), sqlc.narg(comment_id), sqlc.narg(chat_session_id),
-  $3, $4, $5, $6, $7, $8
+  $3, $4, $5, $6, $7, $8,
+  sqlc.narg(content_sha256), sqlc.narg(source)
 )
 RETURNING *;
+
+-- name: FindAttachmentByContentSha256 :one
+-- Workspace-scoped dedup lookup for §14.1.3. Returns the most-recently-
+-- created attachment with this hash, so the bridge can reuse its
+-- storage URL instead of re-uploading the same blob.
+SELECT * FROM attachment
+WHERE workspace_id = $1 AND content_sha256 = $2
+ORDER BY created_at DESC
+LIMIT 1;
 
 -- name: ListAttachmentsByIssue :many
 SELECT * FROM attachment

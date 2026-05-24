@@ -122,7 +122,13 @@ type Handler struct {
 	// 创建任务 verb routes through this service. Nil-safe — when unset,
 	// the webhook silently acknowledges message events without dispatching.
 	LarkThread *service.LarkThreadService
-	cfg        Config
+	// LarkMedia downloads images/PDFs from Lark threads and attaches
+	// them to the new issue (§14.1.3). Optional — when nil or
+	// unconfigured (no Storage in tests), @bot 创建任务 still creates
+	// the issue but skips media downloads. Per §11 invariant 3 the
+	// agent only ever sees attachments via multica's storage URL.
+	LarkMedia *service.LarkMediaService
+	cfg       Config
 }
 
 func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *events.Bus, emailService *service.EmailService, store storage.Storage, cfSigner *auth.CloudFrontSigner, analyticsClient analytics.Client, cfg Config, daemonHubs ...*daemonws.Hub) *Handler {

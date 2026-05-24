@@ -397,6 +397,17 @@ func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWri
 		return
 	}
 	cleaned := service.StripLarkMentionPlaceholders(rawText)
+
+	// §14.1.2: slash trio is parsed BEFORE the @bot verb path. It
+	// short-circuits without requiring a workspace binding so /help
+	// and /whoami stay useful in an unbound chat (the discoverability
+	// use case). /status surfaces "this chat is unbound" inside its
+	// own renderer rather than relying on the outer gate.
+	if slash := parseLarkSlashCommand(cleaned); slash != larkSlashNone {
+		h.handleLarkSlashCommand(ctx, msg, evt.Event.Sender.SenderID.OpenID, slash)
+		return
+	}
+
 	verb, remainder := service.ParseLarkBotVerb(cleaned)
 	if verb == service.LarkVerbNone {
 		// P5 inbound clarification bridge: a non-verb message that is a
@@ -505,9 +516,65 @@ func (h *Handler) handleLarkCreateIssue(ctx context.Context, msg larkInboundMess
 		return
 	}
 
+	// §14.1.3: download thread media into issue attachments. Best-
+	// effort — issue exists regardless of what landed. Permission
+	// denied surfaces as a throttled bot reply asking the admin
+	// to grant im:resource; other failures show up as inline
+	// placeholder lines that future edits can leave in the body.
+	if h.LarkMedia != nil && h.LarkMedia.Configured() {
+		report := h.LarkMedia.DownloadAndAttach(ctx, workspaceID, "member", creator, issue.ID, tc)
+		if report.PermissionDenied {
+			h.LarkMedia.EmitPermissionWarning(ctx, workspaceID, tc.RootMessageID)
+		}
+		if notices := report.InlineNotices(); len(notices) > 0 {
+			h.appendNoticesToIssueDescription(ctx, issue.ID, notices)
+		}
+	}
+
 	prefix := h.getIssuePrefix(ctx, workspaceID)
 	identifier := fmt.Sprintf("%s-%d", prefix, issue.Number)
 	h.LarkThread.ReplyWithIssueCreated(ctx, tc, identifier, issue.Title)
+}
+
+// appendNoticesToIssueDescription tacks the §14.1.3 placeholder lines
+// onto the issue description. Best-effort: a failed DB write logs and
+// returns — the issue already exists, the missing attachments are
+// already absent, and the reviewer will still see the surviving
+// attachments in the multica issue page.
+func (h *Handler) appendNoticesToIssueDescription(ctx context.Context, issueID pgtype.UUID, notices []string) {
+	if len(notices) == 0 {
+		return
+	}
+	issue, err := h.Queries.GetIssue(ctx, issueID)
+	if err != nil {
+		slog.Warn("lark @bot: refetch issue for notices failed", "err", err)
+		return
+	}
+	var b strings.Builder
+	if issue.Description.Valid {
+		b.WriteString(issue.Description.String)
+		if !strings.HasSuffix(issue.Description.String, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	for _, n := range notices {
+		b.WriteString(n)
+		b.WriteString("\n")
+	}
+	updated := strings.TrimRight(b.String(), "\n")
+	if _, err := h.Queries.UpdateIssue(ctx, db.UpdateIssueParams{
+		ID:            issue.ID,
+		Description:   pgtype.Text{String: updated, Valid: updated != ""},
+		AssigneeType:  issue.AssigneeType,
+		AssigneeID:    issue.AssigneeID,
+		DueDate:       issue.DueDate,
+		ParentIssueID: issue.ParentIssueID,
+		ProjectID:     issue.ProjectID,
+	}); err != nil {
+		slog.Warn("lark @bot: append notices to issue description failed",
+			"err", err, "issue_id", uuidToString(issue.ID))
+	}
 }
 
 // larkInboundMessage is the projected subset of larkMessageEvent.Event.Message
