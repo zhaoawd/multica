@@ -797,3 +797,268 @@ flowchart TD
 - `lark_action_log.verb` 扩 3 个 verb：`approve_plan` / `enter_testing` / `verify`。
 
 没有新服务、没有新表、没有新桥逻辑。
+
+## 14. 借鉴 feishu-claude-code-bridge 的增量项
+
+> **基线判断**：[zarazhangrui/feishu-claude-code-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge) 的本体模型是"单用户 Lark ↔ 本地 Claude CLI 网关"——PersonalAgent app、per-chat session、本地 cwd 切换、daemon 化部署。这条路线和 §11 的不变量（daemon/agent 对 Lark 无感、IM-aware 集中在 server）正面冲突，**本体不吸收**。但它在 IM 体验上的几个细节是成熟的，可以单独拎出来嫁接到 multica server 的 IM 层，不会动到不变量。
+>
+> 本节按"建议吸收 / polish / 前置质量门 / 显式不吸收"四档分层，每一档列改动面、约束、不做什么。
+
+### 14.1 建议吸收（进入主路径）
+
+这三项针对的不是性能、不是规模，是**新用户第一次用集成时的摩擦**——这种摩擦不解决，路由再准也没人用。**phase 依赖各自不同**，不要一刀切：
+
+- 14.1.2 slash 三件套 → **P1 之后即可，P3 前完成**；只依赖 `handler/lark.go` 的 message 分支和 workspace 绑定。
+- 14.1.1 流式可更新卡片 → **跟 §13 HITL 一起做**（HITL 长跑场景才是真实需求来源）；P3 卡片回写之后，§13 落地的同一窗口内完成。
+- 14.1.3 thread 媒体 → **依赖 §6.5（P5）**，不能放在 P3 前；跟随 P5 一起或在 P5 之后。
+
+#### 14.1.1 流式可更新卡片
+
+**问题**：HITL §13 的 `plan_proposed` / `tests_proposed` 阶段 agent 可能跑几分钟。当前模型是"沉默 → 突然一张终态卡"，用户体感差，且无法区分"agent 在干" vs "agent 挂了"。
+
+**做法**：把"长跑事件"的卡片拆成**占位 → patch → 终态**三个阶段，patch 同一张 `message_id` 的卡片正文（飞书 `im/v1/messages/:message_id` PATCH content），按钮 verb 不变。
+
+复用现有 protocol 事件（不新增 event 名）：
+
+- 触发占位卡的事件：`task:dispatch`（任务派发即发占位卡）。
+- patch 的事件：`task:progress`、`comment:created`（`type IN ('progress_update','clarification')`）。
+- 终态：`*_proposed` 落库（即 `comment:created` 且 `comment.type IN ('plan_proposed','code_proposed','tests_proposed')`）时把卡片 body 替换成完整提案 + 单按钮；以及 `task:completed` / `task:failed` 时切到终态副本。
+
+**新表：`lark_message_ref`** —— 不复用 `lark_delivery_log`，理由是 team/thread 的 best-effort 投递路径并不写 delivery_log，硬塞会让两条投递路径耦合。
+
+```sql
+CREATE TABLE lark_message_ref (
+    id                UUID PRIMARY KEY,
+    workspace_id      UUID NOT NULL REFERENCES workspace(id),
+    issue_id          UUID REFERENCES issue(id),
+    -- 幂等键：同 issue + 同 stage/event_kind + 同 target，只允许一张活跃卡。
+    stage_or_event    TEXT NOT NULL,
+    channel           TEXT NOT NULL CHECK (channel IN ('dm', 'team', 'thread')),
+    target_id         TEXT NOT NULL,     -- chat_id 或 open_id
+    message_id        TEXT NOT NULL,     -- 飞书侧 message_id
+    -- 乐观锁，防止并发 patch 互相覆盖。
+    version           INT  NOT NULL DEFAULT 0,
+    -- 触发上次 patch 的来源标识。当前 in-process event bus 没有全局 event id，
+    -- 这里写 issue/comment/task 主键 + 时间戳形式（例如 `comment:<uuid>` /
+    -- `task:<uuid>:<unix_ms>`）。等 event bus 引入 event id 时再改格式，
+    -- 不阻塞当前实现。
+    last_event_ref    TEXT,
+    status            TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'superseded', 'finalized')),
+    superseded_at     TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX lark_message_ref_active_idx
+    ON lark_message_ref (issue_id, stage_or_event, channel, target_id)
+    WHERE status = 'active';
+```
+
+不变约束：
+
+- 终态写入后置 `status='finalized'`，后续 patch 直接 no-op。HITL **三个推进按钮**（`approve_plan` / `enter_testing` / `verify`）写入时都要同步 finalize 上一张对应阶段的提案卡——`approve_plan` finalize `plan_proposed` 卡，`enter_testing` finalize `code_proposed` 卡，`verify` finalize `tests_proposed` 卡，避免"封板卡片被旧 patch 改回去"。
+- patch 时 `WHERE version = $expected_version` 做 CAS。version 落后的 patch 写 WARN 后丢弃，不重试——重试会写覆盖更新的内容。
+- daemon 一行不改。卡片状态只在 server 侧。
+
+#### 14.1.2 `/help` `/status` `/whoami` 三件套
+
+**问题**：新用户进群第一反应是 `/help`，目前文档里只有 `@bot 创建任务` 这类结构化 verb，发现成本高。
+
+**做法**：`handler/lark_webhook.go` 的 message branch 识别三个 slash command。**不引入"slash command 框架"**——硬编码这三个，未来要加再说。
+
+| 命令 | 群 / DM 行为 | 输出 |
+|---|---|---|
+| `/help` | 群内 `@bot /help` 才响应；DM 直接响应 | 列出 `@bot` 可用 verb（`创建任务` / `link-doc` / `open-meeting`）+ HITL stage 含义 + DM 偏好链接 |
+| `/status` | 群内 `@bot /status`；DM 响应 | **群属性**：绑定的 workspace、`enabled_events`、bot 在线状态。**不**返回个人偏好 |
+| `/whoami` | **群内统一回中性文案**；DM 响应 | 当前 Lark 用户的 multica 绑定状态、绑定的 workspace 列表、是否启用 DM |
+
+`/whoami` 群内统一回："已尝试通过 DM 发送结果；请在 Multica 个人设置确认绑定状态。" **不区分绑定 / 未绑定**——未绑定提示本身也会泄露绑定状态。已绑定用户能在 DM 看到详情；未绑定用户在群里看不到差异，需自己去 multica 设置页绑定。
+
+隐私约束：
+
+- `/whoami` 永不在群里展示个人绑定关系，**也不在群里区分用户是否已绑定**。
+- `/status` 只展示 workspace 维度的群属性，不展示任何用户级偏好。
+- 三个命令都不识别 NLU 别名（"帮助"、"我是谁"），违反 §11 不变量 4。
+
+#### 14.1.3 Lark thread 媒体 → issue attachment
+
+**问题**：§6.5 `@bot 创建任务` 当前只抓 thread 文本。真实使用里 thread 经常贴截图（崩溃截图、UI 草图），落不到 issue 上，agent 就看不到。
+
+**做法**：thread 抓取流程里新增图片/文件 downloader，落到 multica 现有的 file blob 存储，attach 到新建 issue。**agent 始终通过 issue attachment 读图，不接触 Lark API**——不变量 3 不破。
+
+边界条件（这些不是 polish，是 §6.5 的硬约束）：
+
+- **大小限制**：单文件 ≤ 10 MB，单 issue 累计 ≤ 50 MB。超限的图片在 issue 描述里留一行 `[oversized attachment: <filename> <size>]`。
+- **类型白名单**：`image/png`、`image/jpeg`、`image/gif`、`image/webp`、`application/pdf`。其他类型留一行 `[unsupported attachment type: <mime>]`，不下载。
+- **下载失败降级**：Lark API 401 / 403 / 404 → 留一行 `[attachment unavailable: <filename>]`，不阻塞 issue 创建。
+- **权限错误提示**：bot token 权限不足时，bot 回贴 thread 提示 admin 加 `im:resource` scope。这条只发一次，写入 `lark_workspace_binding.last_perm_warning_at`（**需 schema 扩展，见下**），避免每条消息都骚扰群。
+- **去重**：blob 落库前算 `sha256(content)`，命中 workspace 内已存在的 blob 时复用，不重复落库（**需 attachment 表扩展 `content_sha256` 字段，见下**）。
+- **provenance**：attachment 元数据里写 `source = "lark_thread:<chat_id>:<message_id>"`（**需 attachment 表扩展 `source` 字段，见下**）。审计时能直接回链到原消息；同图在多 thread 出现时 provenance 是数组形式。
+
+**schema 改动**（不能宣称"无新表"——需要在现有表上加列；这部分跟 P5 一起做）：
+
+```sql
+-- 权限警告节流
+ALTER TABLE lark_workspace_binding
+    ADD COLUMN last_perm_warning_at TIMESTAMPTZ;
+
+-- attachment 去重 + 来源回链
+ALTER TABLE attachment
+    ADD COLUMN content_sha256 TEXT,
+    ADD COLUMN source TEXT;       -- e.g. 'lark_thread:<chat_id>:<message_id>'
+CREATE INDEX attachment_workspace_sha256_idx
+    ON attachment (workspace_id, content_sha256)
+    WHERE content_sha256 IS NOT NULL;
+```
+
+如果 attachment 表当前不带 `workspace_id`，去重退化为"按 issue 范围去重 + 不写 sha256 索引"——这是显式可接受的降级，不要把"workspace 级去重"作为硬指标。具体降级以 P5 落地时 attachment 表的实际形态为准。
+
+不在范围（写明，避免被翻出来）：
+
+- 视频、音频、长 PDF（>10MB）：当前 agent 上下文也吃不进去，不下载。
+- 飞书云文档作为 attachment：走 §6.3 文档抓取路径，不走 attachment 路径。
+- agent 反向写图回 thread：永不解锁（违反不变量 3）。
+
+### 14.2 增强 / 可观测 polish（P3 之后做，可单独拎出来）
+
+#### 14.2.1 投递失败诊断面板
+
+**做法**：§6.7 admin UI 的 Workspace Settings → Integrations → Lark 加一栏 "Recent delivery issues"，读 `lark_delivery_log` 里 `status='failed'` 的最近 50 条。
+
+展示列：`created_at`、`event_kind`、`channel`、`target_type`（dm / team / thread）、`attempt`、`last_error`（错误摘要，**不**展示完整 payload）。
+
+脱敏约束：
+
+- 不展示 `payload_json` 全文，只展示 `event_kind` + 一行错误摘要。
+- 不展示 `lark_open_id` 全量（前 4 + 后 4，中间打码）；不展示 bot token 任何片段。
+- error 字段 server 端预过滤敏感词（`token`、`secret`、`Bearer`）后再返回前端。
+
+**不**做的事：
+
+- **不**让 admin 在面板上直接重试单条投递。重试是 worker 的事，admin 看不到 worker 队列状态；提供"重试"按钮等于让人盲操。如果未来 worker 有死信队列，再单独做。
+- **不**仿 bridge 的 `/doctor` 把日志喂回 Claude 自检。Lark 集成的问题是配置 + 权限问题，spawn agent 看日志是错的工具。
+
+#### 14.2.2 路由矩阵 golden test（**这条单列在 14.3，是前置质量门，不是 polish**）
+
+#### 14.2.3 不做：澄清回复 debounce
+
+§6.6 的回复 debounce 之前曾考虑作为 polish，**现已撤回**。理由：
+
+- 唤醒 agent 是 cheap 的（重新入队），agent 实际跑的时候会一次读到所有新 comment，"唤醒 3 次"在 agent 侧大概率被 collapse 成一次推理。
+- 多实例 server 里内存 timer 不稳，正确实现需要队列/DB 层支持，复杂度不匹配收益。
+- 真实问题可能是"comment 流被三条短句污染、上下文断成三段"，但这是产品决策（要不要在 server 端 merge 短 comment），不是 debounce 能解的。
+
+写进文档明确不做，避免日后有人翻出来再争论。**等 P6 跑稳后观察 comment 流污染是否真发生**，再决定是否做 server-side comment merge（不是 debounce）。
+
+### 14.3 P3 / P5 前置质量门：路由矩阵 golden test
+
+> **§6.1 的路由表是整套设计的命门——错一格，团队群就被淹，或该到的人没收到。把这张表用 golden file 钉住，比写 e2e 更值。**
+
+**做法**：在 `service/lark_notify_test.go` 旁加一个 `routing_matrix.golden.yaml`，表驱动跑过每一个组合：
+
+```yaml
+# 每条 case 描述：输入条件 + 期望路由结果
+- name: issue_created_no_assignee_no_thread
+  event: issue:created
+  has_assignee: false
+  has_lark_issue_link: false
+  user_pref: {}
+  expected:
+    channels: [team]
+    card: claim_card
+
+- name: issue_created_no_assignee_with_thread
+  event: issue:created
+  has_assignee: false
+  has_lark_issue_link: true
+  user_pref: {}
+  expected:
+    channels: [thread_reply]
+    card: created_confirmation
+    # 显式断言：不能同时进群顶部
+    must_not_channels: [team]
+
+- name: task_failed_with_assignee
+  event: task:failed
+  has_assignee: true
+  has_lark_issue_link: false
+  user_pref: { task_failed: { dm: opt_in } }
+  expected:
+    channels: [dm]
+    must_not_channels: [team]
+
+- name: task_failed_public_blocker
+  event: task:failed
+  has_assignee: false
+  has_lark_issue_link: false
+  user_pref: {}
+  expected:
+    channels: [team]
+    card: public_blocker
+
+- name: comment_clarification_with_thread
+  event: comment:created
+  comment_type: clarification
+  has_assignee: true
+  has_lark_issue_link: true
+  user_pref: {}
+  expected:
+    channels: [thread_reply]
+    must_not_channels: [team, dm]
+
+- name: comment_clarification_no_thread
+  event: comment:created
+  comment_type: clarification
+  has_assignee: true
+  has_lark_issue_link: false
+  user_pref: {}
+  expected:
+    channels: [dm]
+    must_not_channels: [team]
+```
+
+约束（**golden test 必须满足，否则不是 golden 而是回归**）：
+
+- **范围限定为 Lark 路由相关事件**：在 `service/lark_notify.go` 显式声明 `supportedLarkEvents`（即 §6.1 路由表覆盖的事件：`issue:created` / `issue:updated` / `task:completed` / `task:failed` / `comment:created` / `meeting:created` / `task:dispatch` / `task:progress`），golden 矩阵只穷举这一集合 × `has_assignee {true,false}` × `has_lark_issue_link {true,false}` × `user_pref` 的相关组合。`protocol.EventXxx` 里 chat / github / daemon / project / reaction 等与 Lark 路由无关的事件**不进矩阵**——增加这些事件不应该被 golden 阻塞。
+- 允许部分组合显式标记 `expected.channels: []`（一律静默）。
+- **每条 case 写 `must_not_channels`**：避免"正确路由 + 错误路由"同时发生的 bug 漏过。这条字段比 `expected.channels` 更关键——它能在重构时第一时间报警"你把 dm 事件意外推到了 team"。
+- **路由规则改动 = golden file diff**：code review 时一眼看出"哦你把 task_completed 从 dm 改成 team 了"，不会埋在 100 行 Go 里。
+- **golden 文件不允许手改通过测试**：CI 跑 `go test` 失败时，diff 必须在 PR 描述里解释。
+- **`supportedLarkEvents` 的扩张本身是 golden diff**：往这个集合加事件即触发新 case 行的添加，code review 能看到"新增了 X 类型路由"。
+
+阻塞关系：
+
+- **P3 卡片回写**上线前必须先有这张 golden（卡片按钮的 verb 触发会反向产生事件流，路由不准会刷错卡片）。
+- **P5 thread → issue** 上线前必须先有这张 golden（thread 来源会显著改变 `has_lark_issue_link` 维度，路由组合数翻倍）。
+
+### 14.4 显式不吸收（写入 RFC，封掉日后争论）
+
+bridge 的本体能力，已在前文 §11 不变量里隐式禁止。这里显式列出来：
+
+| 不吸收项 | 为什么不吸收 | 解锁条件 |
+|---|---|---|
+| **PersonalAgent app 模型** | 单用户语义，与 workspace 多租户冲突；不变量 6 已禁止"个人执行流进团队群" | 永不解锁 |
+| **本地 Claude CLI 直接调度（Lark → daemon spawn claude）** | 直接违反 §11 不变量 1、2、3 | 永不解锁 |
+| **WebSocket event stream 取代 webhook 订阅** | multica 是公网 server，webhook 是正确选择；WS 只有"自托管 + 强 NAT"才有意义 | 出现真实自托管 NAT 场景，且 webhook reverse tunnel 走不通 |
+| **per-chat Claude session** | multica 的会话粒度是 issue 不是 chat；绑 chat 就退化成"群里另开一个个人助手"，团队语义全丢 | 永不解锁 |
+| **`/cd` / `/ws save / use / list / remove` 命令组** | 对应"用户在群里切工作目录 / cwd"，和 workspace 绑定语义冲突 | 永不解锁 |
+| **`processes.json` / 多实例进程注册表** | multica 是服务端常驻，单进程模型，不需要 | 出现多 worker 部署且 worker 间需要互相发现 |
+| **本地 `media/` 24h 清理** | 你的 file blob 走现有 storage 生命周期 | 永不解锁 |
+| **QR 设置向导** | 你的设置 UI 走 web，§6.7 已经覆盖 | 永不解锁 |
+| **`/doctor` 把日志喂回 Claude 自检** | Lark 集成问题是配置 / 权限问题，spawn agent 看日志是错的工具；admin UI 看 delivery_log 是对的工具 | 永不解锁 |
+| **澄清回复 debounce** | 见 14.2.3 撤回理由 | P6 跑稳后观察 comment 流污染是否真发生，再考虑 server-side comment merge（不是 debounce） |
+
+### 14.5 改动面总览
+
+| 项 | 改动文件 | 新表 / schema 改动 | phase | 估算 |
+|---|---|---|---|---|
+| 14.1.1 流式卡片 | `service/lark_notify.go` 加 patch 路径；新 migration | 新表 `lark_message_ref` | 跟 §13 HITL 同窗口 | 中 |
+| 14.1.2 三件套 slash | `handler/lark.go` 加 3 个 verb 分支 | — | P1 后、P3 前 | 小 |
+| 14.1.3 thread 媒体 → attachment | `handler/lark.go` `@bot 创建任务` 分支；`service/lark_docs.go` 同级加 downloader | `lark_workspace_binding` + `last_perm_warning_at`；`attachment` + `content_sha256` / `source` | 随 P5（或 P5 之后） | 中 |
+| 14.2.1 失败诊断面板 | `handler/lark_settings.go` 加 GET endpoint；web 端 UI | — | P3 后 | 小 |
+| 14.3 路由 golden test | `service/lark_notify_test.go` + `routing_matrix.golden.yaml` + 显式 `supportedLarkEvents` | — | **阻塞 P3 / P5 上线** | 小 |
+
+14.4 全部 0 改动。
+
+---
