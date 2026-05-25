@@ -46,8 +46,12 @@ type IssueResponse struct {
 	DueDate       *string                 `json:"due_date"`
 	CreatedAt     string                  `json:"created_at"`
 	UpdatedAt     string                  `json:"updated_at"`
-	Reactions     []IssueReactionResponse `json:"reactions,omitempty"`
-	Attachments   []AttachmentResponse    `json:"attachments,omitempty"`
+	// Metadata is the per-issue KV map (see issue_metadata.go). Always emitted
+	// (empty object when unset) so frontend code can `issue.metadata[key]`
+	// without nil-guarding the parent field.
+	Metadata    map[string]any          `json:"metadata"`
+	Reactions   []IssueReactionResponse `json:"reactions,omitempty"`
+	Attachments []AttachmentResponse    `json:"attachments,omitempty"`
 	// Labels are bulk-attached by list/detail endpoints so the client can render
 	// chips without an N+1 round-trip per row. Pointer + omitempty so paths that
 	// don't load labels (e.g. UpdateIssue, batch UpdateIssues, the issue:updated
@@ -79,6 +83,7 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 		DueDate:       timestampToPtr(i.DueDate),
 		CreatedAt:     timestampToString(i.CreatedAt),
 		UpdatedAt:     timestampToString(i.UpdatedAt),
+		Metadata:      parseIssueMetadata(i.Metadata),
 	}
 }
 
@@ -105,6 +110,7 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 		DueDate:       timestampToPtr(i.DueDate),
 		CreatedAt:     timestampToString(i.CreatedAt),
 		UpdatedAt:     timestampToString(i.UpdatedAt),
+		Metadata:      parseIssueMetadata(i.Metadata),
 	}
 }
 
@@ -161,6 +167,7 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		DueDate:       timestampToPtr(i.DueDate),
 		CreatedAt:     timestampToString(i.CreatedAt),
 		UpdatedAt:     timestampToString(i.UpdatedAt),
+		Metadata:      parseIssueMetadata(i.Metadata),
 	}
 }
 
@@ -741,16 +748,36 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		}
 		projectFilter = id
 	}
+	// involves_user_id widens the assignee filter to surface issues where the
+	// user is the indirect assignee (their owned agent, or a squad they belong
+	// to / lead / have an agent inside). Direct member-assignment is excluded
+	// by design — that is the meaning of `assignee_id` (tab 1), and tab 3 must
+	// be disjoint from tab 1.
+	var involvesUserFilter pgtype.UUID
+	if u := r.URL.Query().Get("involves_user_id"); u != "" {
+		id, ok := parseUUIDOrBadRequest(w, u, "involves_user_id")
+		if !ok {
+			return
+		}
+		involvesUserFilter = id
+	}
+
+	metadataFilter, ok := parseMetadataFilterParam(w, r.URL.Query().Get("metadata"))
+	if !ok {
+		return
+	}
 
 	// open_only=true returns all non-done/cancelled issues (no limit).
 	if r.URL.Query().Get("open_only") == "true" {
 		issues, err := h.Queries.ListOpenIssues(ctx, db.ListOpenIssuesParams{
-			WorkspaceID: wsUUID,
-			Priority:    priorityFilter,
-			AssigneeID:  assigneeFilter,
-			AssigneeIds: assigneeIdsFilter,
-			CreatorID:   creatorFilter,
-			ProjectID:   projectFilter,
+			WorkspaceID:    wsUUID,
+			Priority:       priorityFilter,
+			AssigneeID:     assigneeFilter,
+			AssigneeIds:    assigneeIdsFilter,
+			CreatorID:      creatorFilter,
+			ProjectID:      projectFilter,
+			InvolvesUserID: involvesUserFilter,
+			MetadataFilter: metadataFilter,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list issues")
@@ -798,16 +825,27 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		statusFilter = pgtype.Text{String: s, Valid: true}
 	}
 
+	// scheduled=true restricts the result to issues that have at least one of
+	// start_date / due_date set. Used by the Project Gantt view, which only
+	// renders schedulable rows and shouldn't pay for the full project list.
+	var scheduledFilter pgtype.Bool
+	if r.URL.Query().Get("scheduled") == "true" {
+		scheduledFilter = pgtype.Bool{Bool: true, Valid: true}
+	}
+
 	issues, err := h.Queries.ListIssues(ctx, db.ListIssuesParams{
-		WorkspaceID: wsUUID,
-		Limit:       int32(limit),
-		Offset:      int32(offset),
-		Status:      statusFilter,
-		Priority:    priorityFilter,
-		AssigneeID:  assigneeFilter,
-		AssigneeIds: assigneeIdsFilter,
-		CreatorID:   creatorFilter,
-		ProjectID:   projectFilter,
+		WorkspaceID:    wsUUID,
+		Limit:          int32(limit),
+		Offset:         int32(offset),
+		Status:         statusFilter,
+		Priority:       priorityFilter,
+		AssigneeID:     assigneeFilter,
+		AssigneeIds:    assigneeIdsFilter,
+		CreatorID:      creatorFilter,
+		ProjectID:      projectFilter,
+		InvolvesUserID: involvesUserFilter,
+		Scheduled:      scheduledFilter,
+		MetadataFilter: metadataFilter,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list issues")
@@ -816,13 +854,16 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 
 	// Get the true total count for pagination awareness.
 	total, err := h.Queries.CountIssues(ctx, db.CountIssuesParams{
-		WorkspaceID: wsUUID,
-		Status:      statusFilter,
-		Priority:    priorityFilter,
-		AssigneeID:  assigneeFilter,
-		AssigneeIds: assigneeIdsFilter,
-		CreatorID:   creatorFilter,
-		ProjectID:   projectFilter,
+		WorkspaceID:    wsUUID,
+		Status:         statusFilter,
+		Priority:       priorityFilter,
+		AssigneeID:     assigneeFilter,
+		AssigneeIds:    assigneeIdsFilter,
+		CreatorID:      creatorFilter,
+		ProjectID:      projectFilter,
+		InvolvesUserID: involvesUserFilter,
+		Scheduled:      scheduledFilter,
+		MetadataFilter: metadataFilter,
 	})
 	if err != nil {
 		total = int64(len(issues))
@@ -1015,6 +1056,55 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 		}
 		where = append(where, fmt.Sprintf("i.project_id = %s::uuid", addArg(id)))
 	}
+	if filter, ok := parseMetadataFilterParam(w, r.URL.Query().Get("metadata")); !ok {
+		return
+	} else if filter != nil {
+		where = append(where, fmt.Sprintf("i.metadata @> %s::jsonb", addArg(string(filter))))
+	}
+	// Mirror the involves_user_id 4-branch UNION from sqlc's ListIssues /
+	// ListOpenIssues / CountIssues. ListGroupedIssues is a hand-written dynamic
+	// SQL builder that does not share parameters with sqlc, so the fragment is
+	// re-implemented here in lock-step. Member-direct assignment is excluded by
+	// design: that semantics belongs to tab 1 (`assignee_id`), and tab 3 must
+	// stay disjoint from tab 1.
+	if raw := r.URL.Query().Get("involves_user_id"); raw != "" {
+		id, ok := parseUUIDOrBadRequest(w, raw, "involves_user_id")
+		if !ok {
+			return
+		}
+		ref := addArg(id)
+		where = append(where, fmt.Sprintf(`(
+    (i.assignee_type = 'agent' AND i.assignee_id IN (
+       SELECT a.id FROM agent a
+        WHERE a.workspace_id = $1
+          AND a.owner_id     = %[1]s::uuid
+    ))
+    OR (i.assignee_type = 'squad' AND i.assignee_id IN (
+       SELECT sm.squad_id
+         FROM squad_member sm
+         JOIN squad s ON s.id = sm.squad_id
+        WHERE s.workspace_id = $1
+          AND sm.member_type = 'member'
+          AND sm.member_id   = %[1]s::uuid
+       UNION
+       SELECT s.id
+         FROM squad s
+         JOIN agent a ON a.id = s.leader_id
+        WHERE s.workspace_id = $1
+          AND a.workspace_id = $1
+          AND a.owner_id     = %[1]s::uuid
+       UNION
+       SELECT sm.squad_id
+         FROM squad_member sm
+         JOIN squad s ON s.id = sm.squad_id
+         JOIN agent a ON a.id = sm.member_id
+        WHERE s.workspace_id = $1
+          AND sm.member_type = 'agent'
+          AND a.workspace_id = $1
+          AND a.owner_id     = %[1]s::uuid
+    ))
+)`, ref))
+	}
 
 	assigneeFilters, ok := parseActorFilterList(w, r.URL.Query().Get("assignee_filters"), "assignee_filters")
 	if !ok {
@@ -1112,7 +1202,7 @@ WITH ranked AS (
 		i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
 		i.parent_issue_id, i.position, i.due_date, i.created_at, i.updated_at,
-		i.number, i.project_id,
+		i.number, i.project_id, i.metadata,
 		COUNT(*) OVER (PARTITION BY i.assignee_type, i.assignee_id) AS group_total,
 		ROW_NUMBER() OVER (
 			PARTITION BY i.assignee_type, i.assignee_id
@@ -1125,7 +1215,7 @@ SELECT
 	id, workspace_id, title, description, status, priority,
 	assignee_type, assignee_id, creator_type, creator_id,
 	parent_issue_id, position, due_date, created_at, updated_at,
-	number, project_id, group_total
+	number, project_id, metadata, group_total
 FROM ranked
 WHERE rn > %s AND rn <= %s + %s
 ORDER BY
@@ -1168,6 +1258,7 @@ ORDER BY
 			&row.UpdatedAt,
 			&row.Number,
 			&row.ProjectID,
+			&row.Metadata,
 			&row.GroupTotal,
 		); err != nil {
 			slog.Warn("ListGroupedIssues scan failed", "error", err)
@@ -2168,6 +2259,15 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
 	}
 
+	// Platform-driven parent notification: when this issue transitions into
+	// `done` and has a parent, post a top-level system comment on the parent
+	// (MUL-2538 — replaces the agent-prompt rule that caused self-mention
+	// loops in PR #2918). The helper guards on transition + parent state and
+	// fails best-effort.
+	if statusChanged {
+		h.notifyParentOfChildDone(r.Context(), prevIssue, issue)
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -2302,7 +2402,10 @@ func (h *Handler) DeleteIssue(w http.ResponseWriter, r *http.Request) {
 	// Collect all attachment URLs (issue-level + comment-level) before CASCADE delete.
 	attachmentURLs, _ := h.Queries.ListAttachmentURLsByIssueOrComments(r.Context(), issue.ID)
 
-	err := h.Queries.DeleteIssue(r.Context(), issue.ID)
+	err := h.Queries.DeleteIssue(r.Context(), db.DeleteIssueParams{
+		ID:          issue.ID,
+		WorkspaceID: issue.WorkspaceID,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete issue")
 		return
@@ -2580,6 +2683,12 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
 		}
 
+		// Platform-driven parent notification, mirrored from UpdateIssue
+		// (MUL-2538). Best-effort; failure does not abort the batch.
+		if statusChanged {
+			h.notifyParentOfChildDone(r.Context(), prevIssue, issue)
+		}
+
 		updated++
 	}
 
@@ -2633,7 +2742,10 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 		// Collect attachment URLs before CASCADE delete to clean up S3 objects.
 		attachmentURLs, _ := h.Queries.ListAttachmentURLsByIssueOrComments(r.Context(), issue.ID)
 
-		if err := h.Queries.DeleteIssue(r.Context(), issue.ID); err != nil {
+		if err := h.Queries.DeleteIssue(r.Context(), db.DeleteIssueParams{
+			ID:          issue.ID,
+			WorkspaceID: issue.WorkspaceID,
+		}); err != nil {
 			slog.Warn("batch delete issue failed", "issue_id", issueID, "error", err)
 			continue
 		}

@@ -200,10 +200,82 @@ func TestBuildPromptSquadLeaderNoActionForAgentTrigger(t *testing.T) {
 	}
 }
 
+// TestBuildPromptCommentTriggerPromotesThreadReads pins MUL-2387 + MUL-2421:
+// the per-turn prompt for a comment-triggered task must default the trigger
+// thread read to `--thread <id> --tail 30` (so long threads don't dump
+// hundreds of replies into the agent's context) and explain reply-cursor
+// pagination for older replies. --recent N stays as the cross-thread
+// fallback. Locking this in test stops the guidance from decaying back to
+// either the legacy full-flat-dump or the unbounded `--thread` recipe.
+func TestBuildPromptCommentTriggerPromotesThreadReads(t *testing.T) {
+	const (
+		issueID   = "issue-thread-1"
+		triggerID = "trigger-comment-1"
+	)
+	task := Task{
+		IssueID:               issueID,
+		TriggerCommentID:      triggerID,
+		TriggerCommentContent: "anything",
+		TriggerAuthorType:     "member",
+		TriggerAuthorName:     "Bohan",
+	}
+	out := BuildPrompt(task, "claude")
+
+	mustContain := []string{
+		"--thread " + triggerID,
+		"--tail 30",
+		"`multica issue comment list " + issueID + " --thread " + triggerID + " --tail 30 --output json`",
+		"Next reply cursor:",
+		"--before-id <reply-id>",
+		"--recent 20 --output json",
+		"Next thread cursor",
+		"--before",
+		"--before-id",
+		"--since",
+		"may combine with `--thread --tail` or `--recent`",
+		"Avoid the unfiltered",
+		"wastes context",
+	}
+	for _, s := range mustContain {
+		if !strings.Contains(out, s) {
+			t.Errorf("buildCommentPrompt missing thread-first guidance %q\n--- output ---\n%s", s, out)
+		}
+	}
+
+	if strings.Contains(out, "returns all comments for the issue (server caps at 2000)") {
+		t.Errorf("buildCommentPrompt still carries the legacy full-dump phrasing")
+	}
+	if strings.Contains(out, "--thread "+triggerID+" --output json") {
+		t.Errorf("buildCommentPrompt regressed to unbounded --thread recipe (no --tail) — long threads will overflow context\n--- output ---\n%s", out)
+	}
+}
+
+// TestBuildPromptDefaultMentionsRecent pins that the catch-all fallback
+// prompt (no trigger comment, no chat, no autopilot, no quick-create) also
+// teaches the agent about --recent as the long-issue-friendly alternative
+// to the flat dump.
+func TestBuildPromptDefaultMentionsRecent(t *testing.T) {
+	out := BuildPrompt(Task{IssueID: "issue-default-1"}, "claude")
+	for _, s := range []string{
+		"--recent 20 --output json",
+		"Next thread cursor:",
+		"--since",
+	} {
+		if !strings.Contains(out, s) {
+			t.Errorf("default BuildPrompt missing %q\n--- output ---\n%s", s, out)
+		}
+	}
+	if strings.Contains(out, "--thread") {
+		t.Errorf("default BuildPrompt should NOT mention --thread (no trigger comment to anchor on)\n--- output ---\n%s", out)
+	}
+	if strings.Contains(out, "If you need comment history") {
+		t.Errorf("default BuildPrompt still carries the legacy 'If you need' soft phrasing that conflicts with the mandatory workflow\n--- output ---\n%s", out)
+	}
+}
+
 // TestBuildPromptLinkedDocs_DefaultBranch verifies that Lark doc bodies
 // expanded server-side at claim time are embedded into the default issue
-// prompt. The agent must see the doc content as plain text — that is the
-// whole point of P3.A doc expansion.
+// prompt.
 func TestBuildPromptLinkedDocs_DefaultBranch(t *testing.T) {
 	task := Task{
 		IssueID: "issue-123",
@@ -246,7 +318,7 @@ func TestBuildPromptLinkedDocs_CommentBranch(t *testing.T) {
 
 // TestBuildPromptLinkedDocs_EmptyIsByteIdentical verifies that tasks with
 // no linked docs produce exactly the prompt they did before the LinkedDocs
-// field existed — i.e. the wiring change must not perturb existing prompts.
+// field existed.
 func TestBuildPromptLinkedDocs_EmptyIsByteIdentical(t *testing.T) {
 	task := Task{IssueID: "issue-123"}
 	out := BuildPrompt(task, "claude")

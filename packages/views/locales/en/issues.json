@@ -77,9 +77,20 @@
   "view": {
     "tooltip_board": "Board view",
     "tooltip_list": "List view",
+    "tooltip_gantt": "Gantt view",
     "section": "View",
     "board": "Board",
-    "list": "List"
+    "list": "List",
+    "gantt": "Gantt"
+  },
+  "gantt": {
+    "header_issue": "Issue",
+    "zoom_day": "Day",
+    "zoom_week": "Week",
+    "zoom_month": "Month",
+    "show_completed": "Show completed",
+    "empty": "No scheduled issues yet — set a start or due date on any issue to see it on the timeline.",
+    "inverted_dates_warning": "Start date is after due date — bar shown from min to max."
   },
   "actor_issues": {
     "scope": {
@@ -101,7 +112,9 @@
         "title": "No created issues",
         "description": "Issues created here will appear in this view."
       }
-    }
+    },
+    "search_placeholder": "Search issues...",
+    "search_empty": "No issues match your search."
   },
   "list": {
     "empty_status": "No issues",
@@ -117,6 +130,7 @@
   },
   "detail": {
     "not_found": "This issue does not exist or has been deleted in this workspace.",
+    "breadcrumb_project_unknown": "Unknown project",
     "back_to_issues": "Back to Issues",
     "title_placeholder": "Issue title",
     "desc_placeholder": "Add description...",
@@ -128,6 +142,7 @@
     "section_properties": "Properties",
     "section_parent_issue": "Parent issue",
     "section_pull_requests": "Pull requests",
+    "section_metadata": "Metadata",
     "section_details": "Details",
     "section_token_usage": "Token usage",
     "pull_requests_loading": "Loading…",
@@ -262,6 +277,15 @@
     "expand_tooltip": "Expand",
     "collapse_tooltip": "Collapse"
   },
+  "agent_activity": {
+    "hover_header_one": "{{count}} agent working",
+    "hover_header_other": "{{count}} agents working",
+    "status_running": "Working",
+    "status_queued": "Queued",
+    "chip_label": "working",
+    "empty_hover": "No agents currently working",
+    "filter_active_label": "Viewing only working agents"
+  },
   "agent_live": {
     "is_working": "{{name}} is working",
     "is_queued": "{{name}} is queued",
@@ -326,7 +350,8 @@
     "cancel": "Cancel"
   },
   "card": {
-    "update_failed": "Failed to update issue"
+    "update_failed": "Failed to update issue",
+    "updated_ago": "Updated {{time}}"
   },
   "actions": {
     "status": "Status",

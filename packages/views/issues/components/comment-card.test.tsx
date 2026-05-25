@@ -16,6 +16,30 @@ vi.mock("@multica/core/api", () => ({
   PreviewUnsupportedError: class extends Error {},
 }));
 
+// HtmlAttachmentPreview (kind="html" dispatch from AttachmentBlock) reads
+// useNavigation() + useWorkspaceSlug() for the Open-in-new-tab button.
+// Mock both so the standalone-attachment-routes-to-iframe test does not
+// need the surrounding NavigationProvider / WorkspaceSlugProvider tree.
+vi.mock("../../navigation", () => ({
+  useNavigation: () => ({
+    push: vi.fn(),
+    replace: vi.fn(),
+    back: vi.fn(),
+    pathname: "/acme/issues",
+    searchParams: new URLSearchParams(),
+    openInNewTab: vi.fn(),
+    getShareableUrl: (p: string) => `https://app.example${p}`,
+  }),
+}));
+
+vi.mock("@multica/core/paths", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@multica/core/paths")>();
+  return {
+    ...actual,
+    useWorkspaceSlug: () => "acme",
+  };
+});
+
 import { AttachmentList } from "./comment-card";
 
 function renderWithQuery(ui: ReactElement) {

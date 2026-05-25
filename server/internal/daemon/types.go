@@ -33,38 +33,48 @@ type ProjectResourceData struct {
 // Task represents a claimed task from the server.
 // Agent data (name, skills) is populated by the claim endpoint.
 type Task struct {
-	ID                           string                `json:"id"`
-	AgentID                      string                `json:"agent_id"`
-	RuntimeID                    string                `json:"runtime_id"`
-	IssueID                      string                `json:"issue_id"`
-	IssueTitle                   string                `json:"issue_title,omitempty"`
-	IssueDescription             string                `json:"issue_description,omitempty"`
-	WorkspaceID                  string                `json:"workspace_id"`
-	Agent                        *AgentData            `json:"agent,omitempty"`
-	Repos                        []RepoData            `json:"repos,omitempty"`
-	ProjectID                    string                `json:"project_id,omitempty"`                       // issue's project, when present
-	ProjectTitle                 string                `json:"project_title,omitempty"`                    // human-readable project title for context injection
-	ProjectResources             []ProjectResourceData `json:"project_resources,omitempty"`                // project-scoped resources to expose to the agent
-	HasIssueOrCommentAttachments bool                  `json:"has_issue_or_comment_attachments,omitempty"` // issue-level or issue-comment attachments exist
-	PriorSessionID               string                `json:"prior_session_id,omitempty"`                 // Claude session ID from a previous task on this issue
-	PriorWorkDir                 string                `json:"prior_work_dir,omitempty"`                   // work_dir from a previous task on this issue
-	TriggerCommentID             string                `json:"trigger_comment_id,omitempty"`               // comment that triggered this task
-	TriggerCommentContent        string                `json:"trigger_comment_content,omitempty"`          // content of the triggering comment
-	TriggerAuthorType            string                `json:"trigger_author_type,omitempty"`              // "agent" or "member" — author kind for the triggering comment
-	TriggerAuthorName            string                `json:"trigger_author_name,omitempty"`              // display name of the triggering comment author
-	ChatSessionID                string                `json:"chat_session_id,omitempty"`                  // non-empty for chat tasks
-	ChatMessage                  string                `json:"chat_message,omitempty"`                     // user message content for chat tasks
-	ChatMessageAttachments       []ChatAttachmentMeta  `json:"chat_message_attachments,omitempty"`         // attachments linked to the chat message; agent uses these to `multica attachment download <id>`
-	AutopilotRunID               string                `json:"autopilot_run_id,omitempty"`                 // non-empty for autopilot run_only tasks
-	AutopilotID                  string                `json:"autopilot_id,omitempty"`                     // autopilot that spawned this run
-	AutopilotTitle               string                `json:"autopilot_title,omitempty"`                  // autopilot title used as task context
-	AutopilotDescription         string                `json:"autopilot_description,omitempty"`            // autopilot description used as task prompt
-	AutopilotSource              string                `json:"autopilot_source,omitempty"`                 // manual, schedule, webhook, or api
-	AutopilotTriggerPayload      json.RawMessage       `json:"autopilot_trigger_payload,omitempty"`        // optional trigger payload for webhook/api runs
-	QuickCreatePrompt            string                `json:"quick_create_prompt,omitempty"`              // user's natural-language input for quick-create tasks
-	SquadID                      string                `json:"squad_id,omitempty"`                         // when the picker was a squad, the squad's UUID; Agent is still the resolved leader
-	SquadName                    string                `json:"squad_name,omitempty"`                       // display name for the picker squad, used in prompt text
-	LinkedDocs                   []LinkedDoc           `json:"linked_docs,omitempty"`                      // Lark doc URLs found in issue body/comments, expanded server-side at claim time (P3.A); mirrors handler.AgentTaskResponse.LinkedDocs
+	ID          string `json:"id"`
+	AgentID     string `json:"agent_id"`
+	RuntimeID   string `json:"runtime_id"`
+	IssueID     string `json:"issue_id"`
+	WorkspaceID string `json:"workspace_id"`
+	// WorkspaceContext mirrors workspace.context (the per-workspace system
+	// prompt set in Settings → General). Server populates this on every claim
+	// regardless of task kind so the daemon can inject `## Workspace Context`
+	// into the brief. Empty when the owner hasn't set one.
+	WorkspaceContext        string                `json:"workspace_context,omitempty"`
+	Agent                   *AgentData            `json:"agent,omitempty"`
+	Repos                   []RepoData            `json:"repos,omitempty"`
+	ProjectID               string                `json:"project_id,omitempty"`                // issue's project, when present
+	ProjectTitle            string                `json:"project_title,omitempty"`             // human-readable project title for context injection
+	ProjectResources        []ProjectResourceData `json:"project_resources,omitempty"`         // project-scoped resources to expose to the agent
+	PriorSessionID          string                `json:"prior_session_id,omitempty"`          // Claude session ID from a previous task on this issue
+	PriorWorkDir            string                `json:"prior_work_dir,omitempty"`            // work_dir from a previous task on this issue
+	TriggerCommentID        string                `json:"trigger_comment_id,omitempty"`        // comment that triggered this task
+	TriggerCommentContent   string                `json:"trigger_comment_content,omitempty"`   // content of the triggering comment
+	TriggerAuthorType       string                `json:"trigger_author_type,omitempty"`       // "agent" or "member" — author kind for the triggering comment
+	TriggerAuthorName       string                `json:"trigger_author_name,omitempty"`       // display name of the triggering comment author
+	ChatSessionID           string                `json:"chat_session_id,omitempty"`           // non-empty for chat tasks
+	ChatMessage             string                `json:"chat_message,omitempty"`              // user message content for chat tasks
+	ChatMessageAttachments  []ChatAttachmentMeta  `json:"chat_message_attachments,omitempty"`  // attachments linked to the chat message; agent uses these to `multica attachment download <id>`
+	AutopilotRunID          string                `json:"autopilot_run_id,omitempty"`          // non-empty for autopilot run_only tasks
+	AutopilotID             string                `json:"autopilot_id,omitempty"`              // autopilot that spawned this run
+	AutopilotTitle          string                `json:"autopilot_title,omitempty"`           // autopilot title used as task context
+	AutopilotDescription    string                `json:"autopilot_description,omitempty"`     // autopilot description used as task prompt
+	AutopilotSource         string                `json:"autopilot_source,omitempty"`          // manual, schedule, webhook, or api
+	AutopilotTriggerPayload json.RawMessage       `json:"autopilot_trigger_payload,omitempty"` // optional trigger payload for webhook/api runs
+	QuickCreatePrompt       string                `json:"quick_create_prompt,omitempty"`       // user's natural-language input for quick-create tasks
+	SquadID                 string                `json:"squad_id,omitempty"`                  // when the picker was a squad, the squad's UUID; Agent is still the resolved leader
+	SquadName               string                `json:"squad_name,omitempty"`                // display name for the picker squad, used in prompt text
+	// RequestingUserName + RequestingUserProfileDescription describe the human
+	// the agent is working on behalf of. v1 sources them from the runtime
+	// owner (the user who registered the daemon). Empty when the runtime has
+	// no owner (cloud / system runtimes) or the user hasn't set a description.
+	// Injected into the brief under `## Requesting User`; omitted entirely
+	// when description is empty so the agent doesn't see a useless heading.
+	RequestingUserName               string      `json:"requesting_user_name,omitempty"`
+	RequestingUserProfileDescription string      `json:"requesting_user_profile_description,omitempty"`
+	LinkedDocs                       []LinkedDoc `json:"linked_docs,omitempty"` // Lark doc URLs found in issue body/comments, expanded server-side at claim time (P3.A)
 }
 
 // LinkedDoc mirrors service.LinkedDoc on the daemon side. The server
@@ -94,21 +104,23 @@ type ChatAttachmentMeta struct {
 
 // AgentData holds agent details returned by the claim endpoint.
 type AgentData struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	Instructions string            `json:"instructions"`
-	Skills       []SkillData       `json:"skills"`
-	CustomEnv    map[string]string `json:"custom_env,omitempty"`
-	CustomArgs   []string          `json:"custom_args,omitempty"`
-	McpConfig    json.RawMessage   `json:"mcp_config,omitempty"`
-	Model        string            `json:"model,omitempty"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Instructions  string            `json:"instructions"`
+	Skills        []SkillData       `json:"skills"`
+	CustomEnv     map[string]string `json:"custom_env,omitempty"`
+	CustomArgs    []string          `json:"custom_args,omitempty"`
+	McpConfig     json.RawMessage   `json:"mcp_config,omitempty"`
+	Model         string            `json:"model,omitempty"`
+	ThinkingLevel string            `json:"thinking_level,omitempty"`
 }
 
 // SkillData represents a structured skill for task execution.
 type SkillData struct {
-	Name    string          `json:"name"`
-	Content string          `json:"content"`
-	Files   []SkillFileData `json:"files,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Content     string          `json:"content"`
+	Files       []SkillFileData `json:"files,omitempty"`
 }
 
 // SkillFileData represents a supporting file within a skill.
