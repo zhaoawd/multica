@@ -61,10 +61,11 @@ const (
 // otherwise the integration is silently disabled (notifier no-ops, settings
 // UI shows "not configured", listeners do not fire).
 type LarkConfig struct {
-	AppID              string
-	AppSecret          string
-	VerificationToken  string
-	EncryptKey         string
+	AppID             string
+	AppSecret         string
+	VerificationToken string
+	EncryptKey        string
+	CallbackMode      string // "webhook" (default) or "websocket"
 }
 
 // LarkConfigFromEnv reads the four LARK_* env vars.
@@ -74,7 +75,17 @@ func LarkConfigFromEnv() LarkConfig {
 		AppSecret:         strings.TrimSpace(os.Getenv("LARK_APP_SECRET")),
 		VerificationToken: strings.TrimSpace(os.Getenv("LARK_VERIFICATION_TOKEN")),
 		EncryptKey:        strings.TrimSpace(os.Getenv("LARK_ENCRYPT_KEY")),
+		CallbackMode:      strings.TrimSpace(os.Getenv("LARK_CALLBACK_MODE")),
 	}
+}
+
+// IsWebSocket returns true when the operator has opted into the
+// WebSocket long-connection callback mode (LARK_CALLBACK_MODE=websocket).
+// This mode lets the server receive Lark events without a public callback
+// URL — useful for self-hosted / intranet deployments where Feishu SaaS
+// cannot reach the server over HTTP.
+func (c LarkConfig) IsWebSocket() bool {
+	return strings.EqualFold(c.CallbackMode, "websocket")
 }
 
 // Configured returns true only when every credential is present.
@@ -644,14 +655,14 @@ func (c *LarkClient) ListThreadMessages(ctx context.Context, threadID string, li
 // shape; we only decode the ones the §6.5 thread → issue flow knows
 // how to handle:
 //
-//   text   — body.content is `{"text":"..."}`. No attachments.
-//   image  — body.content is `{"image_key":"img_..."}`. Single
-//            attachment; mime is image/* (Lark doesn't disclose the
-//            exact subtype on the list endpoint, so we leave MimeType
-//            empty and let the downloader read it from Content-Type).
-//   file / media — body.content is `{"file_key":"file_...",
-//            "file_name":"...", "file_size":..., "type":"pdf"}`.
-//            type hints the extension; size is a hint, not authoritative.
+//	text   — body.content is `{"text":"..."}`. No attachments.
+//	image  — body.content is `{"image_key":"img_..."}`. Single
+//	         attachment; mime is image/* (Lark doesn't disclose the
+//	         exact subtype on the list endpoint, so we leave MimeType
+//	         empty and let the downloader read it from Content-Type).
+//	file / media — body.content is `{"file_key":"file_...",
+//	         "file_name":"...", "file_size":..., "type":"pdf"}`.
+//	         type hints the extension; size is a hint, not authoritative.
 //
 // Unknown msg_types (post, sticker, audio, ...) produce empty text and
 // nil attachments — the message still appears in the transcript via

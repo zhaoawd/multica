@@ -195,50 +195,60 @@ func (n *LarkNotify) IssueURL(info IssueInfo) string {
 // with a known UUID we also wire a Claim action button — clicking it
 // round-trips through `POST /api/webhooks/lark` and sets the assignee to
 // the (linked) clicker. Assigned issues or issues with missing IDs
-// fall back to a plain View button.
+// fall back to a plain View button. In websocket mode the Claim button
+// is suppressed because card callbacks cannot flow over the WS transport.
 func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, creatorName string) {
 	n.dispatch(ctx, workspaceID, protocol.EventIssueCreated, func() any {
-		title := fmt.Sprintf("📝 New issue: %s", info.Identifier)
-		desc := info.Title
-		if creatorName != "" {
-			desc = fmt.Sprintf("%s\n\n_Created by %s_", desc, creatorName)
-		}
-		buttons := []cardButton{}
-		if !hasAssignee && info.IssueID != "" {
-			buttons = append(buttons, cardButton{
-				Text:  "Claim",
-				Type:  "primary",
-				Value: map[string]any{"verb": "claim", "issue_id": info.IssueID},
-			})
-		}
-		buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
-		return buildCard(title, desc, buttons)
+		return n.buildIssueCreatedCard(info, hasAssignee, creatorName)
 	})
+}
+
+func (n *LarkNotify) buildIssueCreatedCard(info IssueInfo, hasAssignee bool, creatorName string) map[string]any {
+	title := fmt.Sprintf("📝 New issue: %s", info.Identifier)
+	desc := info.Title
+	if creatorName != "" {
+		desc = fmt.Sprintf("%s\n\n_Created by %s_", desc, creatorName)
+	}
+	buttons := []cardButton{}
+	if !hasAssignee && info.IssueID != "" && !n.cfg.IsWebSocket() {
+		buttons = append(buttons, cardButton{
+			Text:  "Claim",
+			Type:  "primary",
+			Value: map[string]any{"verb": "claim", "issue_id": info.IssueID},
+		})
+	}
+	buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
+	return buildCard(title, desc, buttons)
 }
 
 // NotifyIssueAssigned emits an "issue assigned" card on assignee change.
 // assigneeName is best-effort — empty string just omits the line. The
 // card also carries a "Mark Done" action button so the assignee can
 // close the issue straight from Lark (the webhook resolves the clicker
-// via lark_user_link and applies the status change).
+// via lark_user_link and applies the status change). In websocket mode
+// the button is suppressed — see NotifyIssueCreated.
 func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string, info IssueInfo, assigneeName string) {
 	n.dispatch(ctx, workspaceID, protocol.EventIssueUpdated, func() any {
-		title := fmt.Sprintf("👤 Assigned: %s", info.Identifier)
-		desc := info.Title
-		if assigneeName != "" {
-			desc = fmt.Sprintf("%s\n\n_Assignee: %s_", desc, assigneeName)
-		}
-		buttons := []cardButton{}
-		if info.IssueID != "" {
-			buttons = append(buttons, cardButton{
-				Text:  "Mark Done",
-				Type:  "primary",
-				Value: map[string]any{"verb": "mark_done", "issue_id": info.IssueID},
-			})
-		}
-		buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
-		return buildCard(title, desc, buttons)
+		return n.buildIssueAssignedCard(info, assigneeName)
 	})
+}
+
+func (n *LarkNotify) buildIssueAssignedCard(info IssueInfo, assigneeName string) map[string]any {
+	title := fmt.Sprintf("👤 Assigned: %s", info.Identifier)
+	desc := info.Title
+	if assigneeName != "" {
+		desc = fmt.Sprintf("%s\n\n_Assignee: %s_", desc, assigneeName)
+	}
+	buttons := []cardButton{}
+	if info.IssueID != "" && !n.cfg.IsWebSocket() {
+		buttons = append(buttons, cardButton{
+			Text:  "Mark Done",
+			Type:  "primary",
+			Value: map[string]any{"verb": "mark_done", "issue_id": info.IssueID},
+		})
+	}
+	buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
+	return buildCard(title, desc, buttons)
 }
 
 // NotifyTaskCompleted emits a "task completed" card. P1 doesn't yet link to

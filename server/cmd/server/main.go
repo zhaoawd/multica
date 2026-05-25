@@ -292,7 +292,7 @@ func main() {
 	// shutdown so any pending bumps are flushed before we exit.
 	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval)
 
-	r := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
+	rr := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
 		HTTPMetrics:        httpMetrics,
 		DaemonHub:          daemonHub,
 		DaemonWakeup:       daemonWakeup,
@@ -301,7 +301,26 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    ":" + port,
-		Handler: r,
+		Handler: rr.Router,
+	}
+
+	// Lark WebSocket long-connection client — start when
+	// LARK_CALLBACK_MODE=websocket so the server can receive Lark events
+	// without a public callback URL.
+	larkCfg := service.LarkConfigFromEnv()
+	var larkWS *service.LarkWSClient
+	if larkCfg.Configured() && larkCfg.IsWebSocket() {
+		larkWS = service.NewLarkWSClient(
+			larkCfg,
+			rr.Handler.NewLarkWSMessageHandler(),
+			rr.Handler.NewLarkWSCardActionHandler(),
+		)
+		go func() {
+			slog.Info("lark websocket client starting")
+			if err := larkWS.Start(context.Background()); err != nil {
+				slog.Error("lark websocket client failed", "err", err)
+			}
+		}()
 	}
 
 	// Start background workers.
@@ -377,6 +396,10 @@ func main() {
 	larkShutdownCtx, larkShutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	larkNotify.Stop(larkShutdownCtx)
 	larkShutdownCancel()
+
+	if larkWS != nil {
+		larkWS.Close()
+	}
 
 	if metricsServer != nil {
 		metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)

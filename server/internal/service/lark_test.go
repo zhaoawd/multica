@@ -149,6 +149,74 @@ func TestBuildCard_NoButtonsOmitsActionElement(t *testing.T) {
 	}
 }
 
+func TestWebSocketModeSuppressesActionButtons(t *testing.T) {
+	info := IssueInfo{
+		IssueID:       "uuid-1",
+		WorkspaceSlug: "team",
+		Identifier:    "MUL-42",
+		Title:         "Fix bug",
+	}
+
+	cardHasValueButton := func(card map[string]any) bool {
+		js := CardJSON(card)
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(js), &parsed); err != nil {
+			return false
+		}
+		elements, _ := parsed["elements"].([]any)
+		for _, el := range elements {
+			block, _ := el.(map[string]any)
+			if block["tag"] != "action" {
+				continue
+			}
+			actions, _ := block["actions"].([]any)
+			for _, a := range actions {
+				btn, _ := a.(map[string]any)
+				if _, ok := btn["value"]; ok {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	t.Run("webhook mode includes Claim button", func(t *testing.T) {
+		n := newTestLarkNotify(fullCfg())
+		card := n.buildIssueCreatedCard(info, false, "alice")
+		if !cardHasValueButton(card) {
+			t.Fatal("webhook mode should include Claim action button")
+		}
+	})
+
+	t.Run("websocket mode suppresses Claim button", func(t *testing.T) {
+		cfg := fullCfg()
+		cfg.CallbackMode = "websocket"
+		n := newTestLarkNotify(cfg)
+		card := n.buildIssueCreatedCard(info, false, "alice")
+		if cardHasValueButton(card) {
+			t.Fatal("websocket mode should suppress Claim action button")
+		}
+	})
+
+	t.Run("webhook mode includes Mark Done button", func(t *testing.T) {
+		n := newTestLarkNotify(fullCfg())
+		card := n.buildIssueAssignedCard(info, "bob")
+		if !cardHasValueButton(card) {
+			t.Fatal("webhook mode should include Mark Done action button")
+		}
+	})
+
+	t.Run("websocket mode suppresses Mark Done button", func(t *testing.T) {
+		cfg := fullCfg()
+		cfg.CallbackMode = "websocket"
+		n := newTestLarkNotify(cfg)
+		card := n.buildIssueAssignedCard(info, "bob")
+		if cardHasValueButton(card) {
+			t.Fatal("websocket mode should suppress Mark Done action button")
+		}
+	})
+}
+
 func TestSliceContains(t *testing.T) {
 	if !sliceContains([]string{"a", "b"}, "b") {
 		t.Fatalf("expected b found")

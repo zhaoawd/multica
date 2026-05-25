@@ -70,9 +70,11 @@ type LarkCardCallback struct {
 //	v1 card action         — {"action":{"tag":"button",...}}
 //	v2 event subscription  — {"schema":"2.0","header":{"event_type":"..."},"event":{...}}
 //
-// We sniff a minimal envelope first to pick the branch, then unmarshal
-// the full payload only inside the branch that consumes it. The v2
-// im.message.receive_v1 event is where the P4 @bot dispatcher lives.
+// When LarkCallbackMode is "websocket", message events (v2) are skipped
+// here because they arrive via the WS client. Card callbacks (v1) are
+// still handled here even in websocket mode — the oapi-sdk-go WS client
+// does not dispatch MessageTypeCard, so card buttons must flow through
+// this HTTP path regardless of callback mode.
 func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -102,31 +104,38 @@ func (h *Handler) HandleLarkWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// v1 URL verification handshake (Lark posts once at endpoint setup).
+	// Always handled regardless of callback mode — the operator may need
+	// to verify the URL even in websocket mode.
 	if envelope.Type == "url_verification" {
 		writeJSON(w, http.StatusOK, map[string]string{"challenge": envelope.Challenge})
 		return
 	}
 
+	wsMode := strings.EqualFold(h.LarkCallbackMode, "websocket")
+
 	// v2 event subscription — currently we only dispatch on message
 	// receive (P4 @bot verbs). Other v2 events are silently ack'd.
 	if envelope.Schema == "2.0" {
-		if envelope.Header.EventType == "im.message.receive_v1" {
+		if !wsMode && envelope.Header.EventType == "im.message.receive_v1" {
 			h.handleLarkMessageEvent(r.Context(), w, body)
 			return
 		}
+		// In websocket mode, message events arrive via the WS client.
+		// Ack here so Lark doesn't retry if an operator accidentally
+		// left the HTTP callback configured alongside the WS client.
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
 
-	// v1 interactive-card callback (existing P2.2 path).
+	// v1 interactive-card callback. The oapi-sdk-go WS client does not
+	// dispatch MessageTypeCard (it returns early), so card callbacks
+	// must always go through the HTTP path even in websocket mode.
 	var payload LarkCardCallback
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid payload")
 		return
 	}
 	if payload.Action.Tag != "button" {
-		// Other tags (select_static, picker, ...) may come from cards we
-		// haven't built. Acknowledge silently so Lark doesn't retry.
 		writeJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
@@ -198,77 +207,69 @@ func toastResponse(kind, msg string) larkToast {
 // than HTTP errors (Lark would retry on 5xx and we don't want duplicate
 // claims).
 func (h *Handler) dispatchLarkCardAction(r *http.Request, w http.ResponseWriter, payload LarkCardCallback) {
-	ctx := r.Context()
+	toast := h.processLarkCardAction(r.Context(), payload.OpenID, payload.Action.Value)
+	writeJSON(w, http.StatusOK, toast)
+}
 
-	verb, _ := payload.Action.Value["verb"].(string)
-	issueIDStr, _ := payload.Action.Value["issue_id"].(string)
+// LarkCardActionResult holds the verb, value map from a card callback.
+// Used by both the HTTP webhook path and the WebSocket long-connection path.
+type LarkCardActionResult struct {
+	OpenID string
+	Value  map[string]any
+}
+
+// processLarkCardAction executes the card action business logic and
+// returns a toast response. Transport-agnostic — called by both the
+// HTTP webhook handler and the WebSocket event bridge.
+func (h *Handler) processLarkCardAction(ctx context.Context, openID string, value map[string]any) larkToast {
+	verb, _ := value["verb"].(string)
+	issueIDStr, _ := value["issue_id"].(string)
 	if verb == "" || issueIDStr == "" {
-		writeJSON(w, http.StatusOK, toastResponse("error", "missing verb or issue_id"))
-		return
+		return toastResponse("error", "missing verb or issue_id")
 	}
 
-	// 1) Resolve clicker → multica user via lark_user_link. An unlinked
-	//    Lark user gets a guiding message rather than a silent failure;
-	//    they typically just need to visit Settings → Profile and
-	//    connect their account once.
-	if payload.OpenID == "" {
-		writeJSON(w, http.StatusOK, toastResponse("error", "missing open_id"))
-		return
+	if openID == "" {
+		return toastResponse("error", "missing open_id")
 	}
-	link, err := h.Queries.GetLarkUserLinkByOpenID(ctx, payload.OpenID)
+	link, err := h.Queries.GetLarkUserLinkByOpenID(ctx, openID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeJSON(w, http.StatusOK, toastResponse("warning",
-				"Link your Lark account in Multica → Settings → Profile to act on cards."))
-			return
+			return toastResponse("warning",
+				"Link your Lark account in Multica → Settings → Profile to act on cards.")
 		}
-		slog.Warn("lark webhook: lookup user link", "err", err, "open_id", payload.OpenID)
-		writeJSON(w, http.StatusOK, toastResponse("error", "internal error"))
-		return
+		slog.Warn("lark webhook: lookup user link", "err", err, "open_id", openID)
+		return toastResponse("error", "internal error")
 	}
 
-	// 2) Load the issue. The IssueID lives in action.value, which was
-	//    written by us at card-build time, but we still re-validate at
-	//    the DB boundary: a stale card might reference an issue that's
-	//    been deleted, or a malicious Lark user could craft a button
-	//    payload by hand.
 	issueUUID, err := parseStrictUUID(issueIDStr)
 	if err != nil {
-		writeJSON(w, http.StatusOK, toastResponse("error", "bad issue id"))
-		return
+		return toastResponse("error", "bad issue id")
 	}
 	issue, err := h.Queries.GetIssue(ctx, issueUUID)
 	if err != nil {
-		writeJSON(w, http.StatusOK, toastResponse("error", "issue not found"))
-		return
+		return toastResponse("error", "issue not found")
 	}
 
-	// 3) Verify the clicker is a workspace member of the issue. Without
-	//    this, anyone with the Lark bot in their chat could mutate
-	//    issues in workspaces they don't belong to.
 	if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
 		UserID:      link.UserID,
 		WorkspaceID: issue.WorkspaceID,
 	}); err != nil {
-		writeJSON(w, http.StatusOK, toastResponse("warning",
-			"You are not a member of this workspace."))
-		return
+		return toastResponse("warning", "You are not a member of this workspace.")
 	}
 
 	switch verb {
 	case "claim":
-		h.larkClaimIssue(ctx, w, issue, link.UserID)
+		return h.larkClaimIssueCore(ctx, issue, link.UserID)
 	case "mark_done":
-		h.larkMarkIssueDone(ctx, w, issue)
+		return h.larkMarkIssueDoneCore(ctx, issue)
 	default:
-		writeJSON(w, http.StatusOK, toastResponse("error", "unsupported action"))
+		return toastResponse("error", "unsupported action")
 	}
 }
 
-// larkClaimIssue assigns the issue to the clicking user. The "member"
-// assignee_type matches what the issue-detail UI uses when a human
-// claims via the multica web client.
-func (h *Handler) larkClaimIssue(ctx context.Context, w http.ResponseWriter, issue db.Issue, userID pgtype.UUID) {
+// larkClaimIssueCore assigns the issue to the clicking user and returns
+// a toast. Transport-agnostic.
+func (h *Handler) larkClaimIssueCore(ctx context.Context, issue db.Issue, userID pgtype.UUID) larkToast {
 	updated, err := h.Queries.UpdateIssue(ctx, db.UpdateIssueParams{
 		ID:            issue.ID,
 		AssigneeType:  pgtype.Text{String: "member", Valid: true},
@@ -279,28 +280,25 @@ func (h *Handler) larkClaimIssue(ctx context.Context, w http.ResponseWriter, iss
 	})
 	if err != nil {
 		slog.Warn("lark webhook: claim failed", "err", err, "issue_id", uuidToString(issue.ID))
-		writeJSON(w, http.StatusOK, toastResponse("error", "failed to claim"))
-		return
+		return toastResponse("error", "failed to claim")
 	}
 	wsID := uuidToString(issue.WorkspaceID)
 	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
 	resp := issueToResponse(updated, prefix)
 	h.publish(protocol.EventIssueUpdated, wsID, "member", uuidToString(userID), map[string]any{
-		"issue":             resp,
-		"assignee_changed":  true,
-		"prev_assignee_id":  uuidToString(issue.AssigneeID),
-		"source":            "lark_card_action",
+		"issue":            resp,
+		"assignee_changed": true,
+		"prev_assignee_id": uuidToString(issue.AssigneeID),
+		"source":           "lark_card_action",
 	})
-	writeJSON(w, http.StatusOK, toastResponse("success", "Claimed"))
+	return toastResponse("success", "Claimed")
 }
 
-// larkMarkIssueDone moves the issue to "done". Already-done issues short
-// the publish but still report success — the user clicked Mark Done and
-// the desired end state is already reached.
-func (h *Handler) larkMarkIssueDone(ctx context.Context, w http.ResponseWriter, issue db.Issue) {
+// larkMarkIssueDoneCore moves the issue to "done" and returns a toast.
+// Transport-agnostic.
+func (h *Handler) larkMarkIssueDoneCore(ctx context.Context, issue db.Issue) larkToast {
 	if issue.Status == "done" {
-		writeJSON(w, http.StatusOK, toastResponse("info", "Already done"))
-		return
+		return toastResponse("info", "Already done")
 	}
 	updated, err := h.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
 		ID:     issue.ID,
@@ -308,8 +306,7 @@ func (h *Handler) larkMarkIssueDone(ctx context.Context, w http.ResponseWriter, 
 	})
 	if err != nil {
 		slog.Warn("lark webhook: mark done failed", "err", err, "issue_id", uuidToString(issue.ID))
-		writeJSON(w, http.StatusOK, toastResponse("error", "failed to mark done"))
-		return
+		return toastResponse("error", "failed to mark done")
 	}
 	wsID := uuidToString(issue.WorkspaceID)
 	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
@@ -320,7 +317,7 @@ func (h *Handler) larkMarkIssueDone(ctx context.Context, w http.ResponseWriter, 
 		"prev_status":    issue.Status,
 		"source":         "lark_card_action",
 	})
-	writeJSON(w, http.StatusOK, toastResponse("success", "Marked done"))
+	return toastResponse("success", "Marked done")
 }
 
 // ── P4: message receive event dispatch ─────────────────────────────────
@@ -369,25 +366,28 @@ type larkMessageEvent struct {
 func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWriter, body []byte) {
 	defer writeJSON(w, http.StatusOK, map[string]any{})
 
-	if h.LarkThread == nil || !h.LarkThread.Configured() {
-		slog.Info("lark @bot: integration unconfigured, skipping message event")
-		return
-	}
-
 	var evt larkMessageEvent
 	if err := json.Unmarshal(body, &evt); err != nil {
 		slog.Warn("lark @bot: unmarshal event failed", "err", err)
 		return
 	}
+	h.ProcessLarkMessageEvent(ctx, evt)
+}
+
+// ProcessLarkMessageEvent is the transport-agnostic core of message
+// event handling. Called by both the HTTP webhook path and the WebSocket
+// long-connection bridge.
+func (h *Handler) ProcessLarkMessageEvent(ctx context.Context, evt larkMessageEvent) {
+	if h.LarkThread == nil || !h.LarkThread.Configured() {
+		slog.Info("lark @bot: integration unconfigured, skipping message event")
+		return
+	}
+
 	msg := evt.Event.Message
 	if msg.MessageID == "" || msg.ChatID == "" {
 		return
 	}
 
-	// Only handle text messages from human users. Bot-to-bot and
-	// non-text payloads (image, file, sticker) are silently dropped —
-	// they can't carry a structured verb and treating them as @bot
-	// invocations would just produce spurious replies.
 	if evt.Event.Sender.SenderType != "user" || msg.MsgType != "text" {
 		return
 	}
@@ -398,11 +398,6 @@ func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWri
 	}
 	cleaned := service.StripLarkMentionPlaceholders(rawText)
 
-	// §14.1.2: slash trio is parsed BEFORE the @bot verb path. It
-	// short-circuits without requiring a workspace binding so /help
-	// and /whoami stay useful in an unbound chat (the discoverability
-	// use case). /status surfaces "this chat is unbound" inside its
-	// own renderer rather than relying on the outer gate.
 	if slash := parseLarkSlashCommand(cleaned); slash != larkSlashNone {
 		h.handleLarkSlashCommand(ctx, msg, evt.Event.Sender.SenderID.OpenID, slash)
 		return
@@ -410,22 +405,12 @@ func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWri
 
 	verb, remainder := service.ParseLarkBotVerb(cleaned)
 	if verb == service.LarkVerbNone {
-		// P5 inbound clarification bridge: a non-verb message that is a
-		// reply inside a thread we already bridged (lark_issue_link row
-		// exists for the root) is treated as a Lark-side answer to an
-		// agent's question — land it as a multica comment on the linked
-		// issue. Outside that narrow shape we silently ignore the
-		// message per the design's no-NLU rule (§6.5: "avoid misfires").
 		if evt.Event.Message.RootID != "" {
 			h.handleLarkInboundReply(ctx, msg, evt.Event.Sender.SenderID.OpenID, cleaned)
 		}
 		return
 	}
 
-	// Map chat → workspace. The chat must be bound via the
-	// settings UI for the bot to act in it; an unbound chat with the
-	// bot mistakenly added would otherwise let any user create
-	// issues in an arbitrary workspace.
 	binding, err := h.Queries.GetLarkWorkspaceBindingByChatID(ctx, msg.ChatID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -436,9 +421,6 @@ func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWri
 		return
 	}
 
-	// Map sender → user. Unlinked users get a one-time hint reply so
-	// they can bind from the multica UI; we don't proceed because we
-	// have no creator identity to record on the issue.
 	if evt.Event.Sender.SenderID.OpenID == "" {
 		return
 	}
@@ -453,9 +435,6 @@ func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWri
 		return
 	}
 
-	// Workspace membership gate. The user link is global (one open_id ↔
-	// one multica user), but each verb runs in the context of the chat's
-	// bound workspace — so we must re-verify the user belongs to it.
 	if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
 		UserID:      link.UserID,
 		WorkspaceID: binding.WorkspaceID,
@@ -468,10 +447,6 @@ func (h *Handler) handleLarkMessageEvent(ctx context.Context, w http.ResponseWri
 	case service.LarkVerbCreateIssue:
 		h.handleLarkCreateIssue(ctx, msg, link.UserID, binding.WorkspaceID, remainder)
 	case service.LarkVerbLinkDoc, service.LarkVerbOpenMeeting:
-		// Reserved verbs — recognise them so the user knows they were
-		// understood, but reply explicitly that the implementation is
-		// pending rather than silently dropping (which would look like
-		// the bot ignored them).
 		h.replyToLarkMessage(ctx, msg.MessageID, "该指令暂未实装，敬请期待。")
 	}
 }

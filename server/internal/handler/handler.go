@@ -119,8 +119,9 @@ type Handler struct {
 	// unconfigured (no Storage in tests), @bot 创建任务 still creates
 	// the issue but skips media downloads. Per §11 invariant 3 the
 	// agent only ever sees attachments via multica's storage URL.
-	LarkMedia *service.LarkMediaService
-	cfg       Config
+	LarkMedia        *service.LarkMediaService
+	LarkCallbackMode string // "webhook" (default) or "websocket"
+	cfg              Config
 }
 
 func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *events.Bus, emailService *service.EmailService, store storage.Storage, cfSigner *auth.CloudFrontSigner, analyticsClient analytics.Client, cfg Config, daemonHubs ...*daemonws.Hub) *Handler {

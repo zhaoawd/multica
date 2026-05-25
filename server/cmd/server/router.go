@@ -93,7 +93,15 @@ func parseTrustedProxies(raw string) []netip.Prefix {
 // path Redis client, not the realtime relay's blocking read client. A nil rdb
 // keeps the default in-memory stores which are fine for single-node dev and
 // tests.
-func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analyticsClient analytics.Client, rdb *redis.Client) chi.Router {
+// RouterResult bundles the chi.Router with the Handler instance so
+// callers (main.go) can wire up additional cross-cutting concerns like
+// the Lark WebSocket client that needs access to handler methods.
+type RouterResult struct {
+	Router  chi.Router
+	Handler *handler.Handler
+}
+
+func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analyticsClient analytics.Client, rdb *redis.Client) RouterResult {
 	return NewRouterWithOptions(pool, hub, bus, analyticsClient, rdb, RouterOptions{})
 }
 
@@ -108,7 +116,7 @@ type RouterOptions struct {
 	HeartbeatScheduler handler.HeartbeatScheduler
 }
 
-func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analyticsClient analytics.Client, rdb *redis.Client, opts RouterOptions) chi.Router {
+func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analyticsClient analytics.Client, rdb *redis.Client, opts RouterOptions) RouterResult {
 	queries := db.New(pool)
 	emailSvc := service.NewEmailService()
 	daemonHub := opts.DaemonHub
@@ -179,6 +187,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// the claim path is a no-op.
 	larkCfg := service.LarkConfigFromEnv()
 	larkClient := service.NewLarkClient(larkCfg)
+	h.LarkCallbackMode = larkCfg.CallbackMode
 	h.LarkDocs = service.NewLarkDocs(larkClient)
 	// Lark thread → issue bridge (P4). Shares the LarkClient so the
 	// tenant_access_token cache is single-flight across docs + thread
@@ -709,7 +718,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		})
 	})
 
-	return r
+	return RouterResult{Router: r, Handler: h}
 }
 
 // membershipChecker implements realtime.MembershipChecker using database queries.
