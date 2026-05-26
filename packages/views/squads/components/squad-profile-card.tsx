@@ -1,11 +1,10 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import type { SquadMemberStatus } from "@multica/core/types";
+import type { SquadMemberPreview } from "@multica/core/types";
 import { useWorkspaceId } from "@multica/core/hooks";
 import {
   squadListOptions,
-  squadMemberStatusOptions,
   agentListOptions,
   memberListOptions,
 } from "@multica/core/workspace/queries";
@@ -20,13 +19,6 @@ interface SquadProfileCardProps {
   squadId: string;
 }
 
-const STATUS_DOT_CLASS: Record<string, string> = {
-  working: "bg-success",
-  idle: "bg-muted-foreground/40",
-  offline: "bg-muted-foreground/40",
-  unstable: "bg-warning",
-};
-
 export function SquadProfileCard({ squadId }: SquadProfileCardProps) {
   const { t } = useT("squads");
   const wsId = useWorkspaceId();
@@ -36,9 +28,6 @@ export function SquadProfileCard({ squadId }: SquadProfileCardProps) {
   );
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
   const { data: wsMembers = [] } = useQuery(memberListOptions(wsId));
-  const { data: memberStatusResp } = useQuery(
-    squadMemberStatusOptions(wsId, squadId),
-  );
 
   const squad = squads.find((s) => s.id === squadId);
 
@@ -70,14 +59,8 @@ export function SquadProfileCard({ squadId }: SquadProfileCardProps) {
     .toUpperCase()
     .slice(0, 2);
 
-  const memberStatuses = memberStatusResp?.members ?? [];
-  const leaderFirst = [...memberStatuses].sort((a, b) => {
-    const aLeader = a.member_type === "agent" && a.member_id === squad.leader_id;
-    const bLeader = b.member_type === "agent" && b.member_id === squad.leader_id;
-    if (aLeader && !bLeader) return -1;
-    if (!aLeader && bLeader) return 1;
-    return 0;
-  });
+  const memberPreview = squad.member_preview ?? [];
+  const memberCount = squad.member_count ?? memberPreview.length;
 
   return (
     <div className="group flex flex-col gap-3 text-left">
@@ -116,9 +99,10 @@ export function SquadProfileCard({ squadId }: SquadProfileCardProps) {
         </p>
       )}
 
-      {leaderFirst.length > 0 && (
+      {memberCount > 0 && (
         <MembersList
-          members={leaderFirst}
+          members={memberPreview}
+          memberCount={memberCount}
           leaderId={squad.leader_id}
           agents={agents}
           wsMembers={wsMembers}
@@ -130,11 +114,13 @@ export function SquadProfileCard({ squadId }: SquadProfileCardProps) {
 
 function MembersList({
   members,
+  memberCount,
   leaderId,
   agents,
   wsMembers,
 }: {
-  members: SquadMemberStatus[];
+  members: SquadMemberPreview[];
+  memberCount: number;
   leaderId: string;
   agents: { id: string; name: string }[];
   wsMembers: { user_id: string; name: string; role: string }[];
@@ -142,15 +128,15 @@ function MembersList({
   const { t } = useT("squads");
   const p = useWorkspacePaths();
   const visible = members.slice(0, 3);
-  const overflow = members.length - visible.length;
+  const overflow = Math.max(0, memberCount - visible.length);
 
   return (
     <div className="flex flex-col gap-1.5 text-xs">
       <span className="text-muted-foreground">
         {t(($) => $.profile_card.members_section)}
-        <span className="ml-1 tabular-nums">· {members.length}</span>
+        <span className="ml-1 tabular-nums">· {memberCount}</span>
       </span>
-      <div className="flex max-h-[132px] flex-col gap-0.5 overflow-y-auto">
+      <div className="flex flex-col gap-0.5">
         {visible.map((m) => {
           const isLeader =
             m.member_type === "agent" && m.member_id === leaderId;
@@ -160,20 +146,6 @@ function MembersList({
                 m.member_id.slice(0, 8)
               : wsMembers.find((u) => u.user_id === m.member_id)?.name ??
                 m.member_id.slice(0, 8);
-          const statusDotClass =
-            m.status && m.status in STATUS_DOT_CLASS
-              ? STATUS_DOT_CLASS[m.status]
-              : null;
-          const statusLabel =
-            m.status === "working"
-              ? t(($) => $.members_tab.status_working)
-              : m.status === "idle"
-                ? t(($) => $.members_tab.status_idle)
-                : m.status === "offline"
-                  ? t(($) => $.members_tab.status_offline)
-                  : m.status === "unstable"
-                    ? t(($) => $.members_tab.status_unstable)
-                    : null;
           const href =
             m.member_type === "agent"
               ? p.agentDetail(m.member_id)
@@ -187,7 +159,7 @@ function MembersList({
             <AppLink
               key={`${m.member_type}-${m.member_id}`}
               href={href}
-              className="-mx-1 flex items-center gap-2 rounded-md px-1 py-1 transition-colors hover:bg-accent"
+              className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-accent/60"
             >
               <ActorAvatar
                 actorType={m.member_type}
@@ -196,22 +168,14 @@ function MembersList({
                 showStatusDot={m.member_type === "agent"}
                 className="shrink-0"
               />
-              <span className="min-w-0 truncate font-medium">{name}</span>
+              <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
               {isLeader && (
-                <span className="shrink-0 rounded-md bg-amber-100 px-1 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                <span className="max-w-[4rem] shrink-0 truncate rounded-md bg-amber-100 px-1 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
                   {t(($) => $.members_tab.leader_chip)}
                 </span>
               )}
-              {m.member_type === "agent" && statusLabel && (
-                <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-muted-foreground">
-                  <span
-                    className={`h-1.5 w-1.5 rounded-full ${statusDotClass ?? "bg-muted-foreground/40"}`}
-                  />
-                  {statusLabel}
-                </span>
-              )}
               {m.member_type === "member" && memberRole && (
-                <span className="ml-auto shrink-0 text-muted-foreground">
+                <span className="max-w-[3.5rem] shrink-0 truncate text-muted-foreground">
                   {memberRole}
                 </span>
               )}
@@ -219,7 +183,7 @@ function MembersList({
           );
         })}
         {overflow > 0 && (
-          <span className="text-muted-foreground">
+          <span className="px-2 py-0.5 text-muted-foreground">
             {t(($) => $.profile_card.more_members, { count: overflow })}
           </span>
         )}

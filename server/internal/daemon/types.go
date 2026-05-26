@@ -18,7 +18,8 @@ type Runtime struct {
 
 // RepoData holds repository information from the workspace.
 type RepoData struct {
-	URL string `json:"url"`
+	URL         string `json:"url"`
+	Description string `json:"description,omitempty"`
 }
 
 // ProjectResourceData mirrors handler.ProjectResourceData — a single project
@@ -75,6 +76,12 @@ type Task struct {
 	RequestingUserName               string      `json:"requesting_user_name,omitempty"`
 	RequestingUserProfileDescription string      `json:"requesting_user_profile_description,omitempty"`
 	LinkedDocs                       []LinkedDoc `json:"linked_docs,omitempty"` // Lark doc URLs found in issue body/comments, expanded server-side at claim time (P3.A)
+	// AuthToken is the task-scoped credential the server mints at claim time.
+	// The daemon injects it into the spawned agent as MULTICA_TOKEN so the
+	// agent never sees the daemon's own (often workspace-owner) credential.
+	// Empty when the server-side runtime has no owning user — the daemon
+	// then falls back to its own token. See MUL-2600.
+	AuthToken string `json:"auth_token,omitempty"`
 }
 
 // LinkedDoc mirrors service.LinkedDoc on the daemon side. The server
