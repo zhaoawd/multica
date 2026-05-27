@@ -192,6 +192,9 @@ type IssueInfo struct {
 	Identifier    string
 	Title         string
 	WorkspaceSlug string
+	Status        string
+	Priority      string
+	DueDate       string // RFC 3339 or empty
 }
 
 // IssueURL renders a deep-link to the issue. Falls back to the workspace
@@ -228,9 +231,19 @@ func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string,
 
 func (n *LarkNotify) buildIssueCreatedCard(info IssueInfo, hasAssignee bool, creatorName string) map[string]any {
 	title := fmt.Sprintf("📝 New issue: %s", info.Identifier)
-	desc := info.Title
+	var elements []map[string]any
+	elements = append(elements, map[string]any{
+		"tag": "markdown", "content": "**" + info.Title + "**",
+	})
+	if fields := issueFieldsMarkdown(info); fields != "" {
+		elements = append(elements, map[string]any{
+			"tag": "markdown", "content": fields,
+		})
+	}
 	if creatorName != "" {
-		desc = fmt.Sprintf("%s\n\n_Created by %s_", desc, creatorName)
+		elements = append(elements, map[string]any{
+			"tag": "markdown", "content": "_Created by " + creatorName + "_",
+		})
 	}
 	buttons := []cardButton{}
 	if !hasAssignee && info.IssueID != "" {
@@ -241,7 +254,7 @@ func (n *LarkNotify) buildIssueCreatedCard(info IssueInfo, hasAssignee bool, cre
 		})
 	}
 	buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
-	return buildCard(title, desc, buttons)
+	return buildCardWithElements(title, elements, buttons)
 }
 
 // NotifyIssueAssigned emits an "issue assigned" card on assignee change.
@@ -261,9 +274,19 @@ func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string
 
 func (n *LarkNotify) buildIssueAssignedCard(info IssueInfo, assigneeName string) map[string]any {
 	title := fmt.Sprintf("👤 Assigned: %s", info.Identifier)
-	desc := info.Title
+	var elements []map[string]any
+	elements = append(elements, map[string]any{
+		"tag": "markdown", "content": "**" + info.Title + "**",
+	})
+	if fields := issueFieldsMarkdown(info); fields != "" {
+		elements = append(elements, map[string]any{
+			"tag": "markdown", "content": fields,
+		})
+	}
 	if assigneeName != "" {
-		desc = fmt.Sprintf("%s\n\n_Assignee: %s_", desc, assigneeName)
+		elements = append(elements, map[string]any{
+			"tag": "markdown", "content": "_Assignee: " + assigneeName + "_",
+		})
 	}
 	buttons := []cardButton{}
 	if info.IssueID != "" {
@@ -274,7 +297,7 @@ func (n *LarkNotify) buildIssueAssignedCard(info IssueInfo, assigneeName string)
 		})
 	}
 	buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
-	return buildCard(title, desc, buttons)
+	return buildCardWithElements(title, elements, buttons)
 }
 
 // NotifyTaskCompleted emits a "task completed" card. P1 doesn't yet link to
@@ -292,11 +315,19 @@ func (n *LarkNotify) NotifyTaskCompleted(ctx context.Context, workspaceID string
 func (n *LarkNotify) NotifyTaskFailed(ctx context.Context, workspaceID string, info IssueInfo, errSummary string) {
 	n.dispatch(ctx, workspaceID, protocol.EventTaskFailed, func() any {
 		title := fmt.Sprintf("❌ Task failed: %s", info.Identifier)
-		desc := info.Title
+		var elements []map[string]any
+		elements = append(elements, map[string]any{
+			"tag": "markdown", "content": "**" + info.Title + "**",
+		})
 		if errSummary != "" {
-			desc = fmt.Sprintf("%s\n\n```\n%s\n```", desc, truncate(errSummary, 400))
+			elements = append(elements, map[string]any{
+				"tag": "note",
+				"elements": []map[string]any{
+					{"tag": "plain_text", "content": truncate(errSummary, 400)},
+				},
+			})
 		}
-		return buildCard(title, desc, []cardButton{{Text: "Open", URL: n.IssueURL(info)}})
+		return buildCardWithElements(title, elements, []cardButton{{Text: "Open", URL: n.IssueURL(info)}})
 	})
 }
 
@@ -470,9 +501,13 @@ func (n *LarkNotify) ResolveIssueInfoByID(ctx context.Context, issueID string) (
 		return "", IssueInfo{}, false
 	}
 	wsID := util.UUIDToString(issue.WorkspaceID)
+	dueDate := ""
+	if issue.DueDate.Valid {
+		dueDate = issue.DueDate.Time.Format(time.RFC3339)
+	}
 	ws, err := n.queries.GetWorkspace(ctx, issue.WorkspaceID)
 	if err != nil {
-		return wsID, IssueInfo{IssueID: issueID, WorkspaceID: wsID, Title: issue.Title}, true
+		return wsID, IssueInfo{IssueID: issueID, WorkspaceID: wsID, Title: issue.Title, Status: issue.Status, Priority: issue.Priority, DueDate: dueDate}, true
 	}
 	return wsID, IssueInfo{
 		IssueID:       issueID,
@@ -480,6 +515,9 @@ func (n *LarkNotify) ResolveIssueInfoByID(ctx context.Context, issueID string) (
 		Identifier:    fmt.Sprintf("%s-%d", ws.IssuePrefix, issue.Number),
 		Title:         issue.Title,
 		WorkspaceSlug: ws.Slug,
+		Status:        issue.Status,
+		Priority:      issue.Priority,
+		DueDate:       dueDate,
 	}, true
 }
 
@@ -504,19 +542,21 @@ type cardButton struct {
 	Type  string
 }
 
-// buildCard returns a Lark interactive-card structure. Format follows
-// https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/feishu-cards/card-json-structure
-//
-// We use the "config + header + elements" v1 shape — broadly supported,
-// works on mobile and PC clients, and keeps schemas in our test golden
-// files compact.
+// buildCard returns a Lark interactive-card structure with a single
+// markdown body. Convenience wrapper over buildCardWithElements for
+// simple cards that don't need structured fields.
 func buildCard(headerTitle, markdownBody string, buttons []cardButton) map[string]any {
 	elements := []map[string]any{
-		{
-			"tag":     "markdown",
-			"content": markdownBody,
-		},
+		{"tag": "markdown", "content": markdownBody},
 	}
+	return buildCardWithElements(headerTitle, elements, buttons)
+}
+
+// buildCardWithElements returns a Lark interactive-card with caller-
+// supplied elements (markdown, column_set, note, divider, etc.) and
+// an optional action row. Format follows the "config + header +
+// elements" v1 shape — broadly supported, works on mobile and PC.
+func buildCardWithElements(headerTitle string, elements []map[string]any, buttons []cardButton) map[string]any {
 	if len(buttons) > 0 {
 		actions := make([]map[string]any, 0, len(buttons))
 		for _, b := range buttons {
@@ -529,11 +569,6 @@ func buildCard(headerTitle, markdownBody string, buttons []cardButton) map[strin
 				"text": map[string]any{"tag": "plain_text", "content": b.Text},
 				"type": btnType,
 			}
-			// Action buttons take precedence — when a verb is wired up,
-			// stripping the URL avoids Lark opening a new tab on top of
-			// the callback. Both fields could theoretically coexist on
-			// the Lark side, but the UX of "two things happen at once"
-			// is worse than picking one.
 			if b.Value != nil {
 				btn["value"] = b.Value
 			} else if b.URL != "" {
@@ -553,6 +588,66 @@ func buildCard(headerTitle, markdownBody string, buttons []cardButton) map[strin
 		},
 		"elements": elements,
 	}
+}
+
+// issueFieldsMarkdown renders the status / priority / due-date line
+// for structured cards. Returns "" when all fields are empty so the
+// caller can skip the element entirely.
+func issueFieldsMarkdown(info IssueInfo) string {
+	var parts []string
+	if info.Status != "" {
+		parts = append(parts, statusLabel(info.Status))
+	}
+	if info.Priority != "" && info.Priority != "none" {
+		parts = append(parts, priorityLabel(info.Priority))
+	}
+	if info.DueDate != "" {
+		parts = append(parts, "📅 "+shortDate(info.DueDate))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "  ·  ")
+}
+
+func statusLabel(s string) string {
+	switch s {
+	case "backlog":
+		return "📋 Backlog"
+	case "todo":
+		return "📌 Todo"
+	case "in_progress":
+		return "🔄 In Progress"
+	case "done":
+		return "✅ Done"
+	case "cancelled":
+		return "🚫 Cancelled"
+	default:
+		return s
+	}
+}
+
+func priorityLabel(p string) string {
+	switch p {
+	case "urgent":
+		return "🔴 Urgent"
+	case "high":
+		return "🟠 High"
+	case "medium":
+		return "🟡 Medium"
+	case "low":
+		return "🔵 Low"
+	default:
+		return p
+	}
+}
+
+func shortDate(rfc3339 string) string {
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		return rfc3339
+	}
+	return t.Format("Jan 2")
 }
 
 // CardJSON is a small helper exposed for tests / golden-file checks.
