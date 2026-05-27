@@ -407,14 +407,16 @@ const LarkBridgedCommentMaxRunes = 800
 // ignored (it did not originate from a Lark thread).
 //
 // authorName is best-effort presentational text. content is the raw
-// comment body — markdown is left intact (Lark renders it as plain text
-// in the reply, which is acceptable for the short clarification questions
-// this bridge is designed to carry).
+// comment body — markdown is left intact. issueURL is the deep-link
+// for the card's "View" button; pass "" to omit the button.
+//
+// The reply is an interactive card so agent messages are visually
+// distinct from human replies in the Lark thread.
 //
 // Lark API errors are logged at WARN, never returned: the comment already
 // exists in multica, and a failed cosmetic mirror must not surface as a
 // caller-visible error from the bus dispatch goroutine.
-func (s *LarkThreadService) MirrorAgentCommentToThread(ctx context.Context, issueID pgtype.UUID, authorName, content string) {
+func (s *LarkThreadService) MirrorAgentCommentToThread(ctx context.Context, issueID pgtype.UUID, authorName, content, issueURL string) {
 	if s == nil || s.Client == nil || !s.Client.cfg.Configured() {
 		return
 	}
@@ -423,10 +425,6 @@ func (s *LarkThreadService) MirrorAgentCommentToThread(ctx context.Context, issu
 	}
 	link, err := s.Queries.GetLarkIssueLinkByIssueID(ctx, issueID)
 	if err != nil {
-		// pgx.ErrNoRows is the common case — the issue was not created
-		// from a Lark thread, so there is no thread to reply into. Other
-		// errors are also non-fatal: skipping the cosmetic mirror is
-		// strictly safer than retrying inside the bus goroutine.
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Warn("lark thread: link lookup failed",
 				"err", err,
@@ -438,11 +436,11 @@ func (s *LarkThreadService) MirrorAgentCommentToThread(ctx context.Context, issu
 	if link.RootMessageID == "" {
 		return
 	}
-	body := buildBridgedCommentText(authorName, content)
-	if body == "" {
+	card := buildBridgedCommentCard(authorName, content, issueURL)
+	if card == nil {
 		return
 	}
-	if err := s.Client.ReplyToMessage(ctx, link.RootMessageID, body); err != nil {
+	if err := s.Client.ReplyCardToMessage(ctx, link.RootMessageID, card); err != nil {
 		slog.Warn("lark thread: mirror agent comment failed",
 			"err", err,
 			"issue_id", util.UUIDToString(issueID),
@@ -451,11 +449,46 @@ func (s *LarkThreadService) MirrorAgentCommentToThread(ctx context.Context, issu
 	}
 }
 
-// buildBridgedCommentText formats an agent comment for posting into the
-// Lark thread. The "[multica]" prefix marks the message as bridge traffic
-// so humans in the chat don't misread it as a native Lark user reply.
-// The content is truncated to LarkBridgedCommentMaxRunes; the full text
-// remains in the multica issue.
+// buildBridgedCommentCard renders an agent comment as a compact Lark card.
+// The card header names the agent; the body is truncated markdown. A
+// "View" button links back to the issue in multica.
+func buildBridgedCommentCard(authorName, content, issueURL string) map[string]any {
+	c := strings.TrimSpace(content)
+	if c == "" {
+		return nil
+	}
+	c = truncateRunes(c, LarkBridgedCommentMaxRunes)
+	header := "🤖 multica"
+	if strings.TrimSpace(authorName) != "" {
+		header = "🤖 " + strings.TrimSpace(authorName)
+	}
+	elements := []map[string]any{
+		{"tag": "markdown", "content": c},
+	}
+	if issueURL != "" {
+		elements = append(elements, map[string]any{
+			"tag": "action",
+			"actions": []map[string]any{
+				{
+					"tag":  "button",
+					"text": map[string]any{"tag": "plain_text", "content": "View in Multica"},
+					"type": "default",
+					"url":  issueURL,
+				},
+			},
+		})
+	}
+	return map[string]any{
+		"config": map[string]any{"wide_screen_mode": true},
+		"header": map[string]any{
+			"title": map[string]any{"tag": "plain_text", "content": header},
+		},
+		"elements": elements,
+	}
+}
+
+// buildBridgedCommentText formats an agent comment as plain text. Kept
+// for test compatibility; the live path now uses buildBridgedCommentCard.
 func buildBridgedCommentText(authorName, content string) string {
 	c := strings.TrimSpace(content)
 	if c == "" {

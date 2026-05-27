@@ -353,6 +353,58 @@ func (c *LarkClient) ReplyToMessage(ctx context.Context, messageID, text string)
 	return nil
 }
 
+// ReplyCardToMessage posts an interactive card as a reply to a message.
+// Like ReplyToMessage but sends msg_type=interactive instead of text.
+func (c *LarkClient) ReplyCardToMessage(ctx context.Context, messageID string, card any) error {
+	if !c.cfg.Configured() {
+		return errors.New("lark not configured")
+	}
+	if messageID == "" {
+		return errors.New("message_id required")
+	}
+	cardBytes, err := json.Marshal(card)
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"content":         string(cardBytes),
+		"msg_type":        "interactive",
+		"reply_in_thread": true,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	token, err := c.tenantAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf(c.apiBase+larkReplyMessagePath, messageID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return fmt.Errorf("lark reply card: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("lark reply card: code=%d msg=%s", out.Code, out.Msg)
+	}
+	return nil
+}
+
 // SendTextMessage posts a plain-text message to a recipient identified
 // by `receiveIDType` (the value of Lark's `receive_id_type` query
 // parameter — `chat_id`, `open_id`, `union_id`, `user_id`, or `email`)

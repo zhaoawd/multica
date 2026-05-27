@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
@@ -191,8 +193,31 @@ func registerLarkThreadListeners(bus *events.Bus, larkThread *service.LarkThread
 			return
 		}
 		name := larkActorName(ctx, queries, authorType, authorID)
-		larkThread.MirrorAgentCommentToThread(ctx, issueUUID, name, content)
+		issueURL := larkBuildIssueURL(ctx, queries, issueID)
+		larkThread.MirrorAgentCommentToThread(ctx, issueUUID, name, content, issueURL)
 	})
+}
+
+// larkBuildIssueURL constructs a deep-link to the issue for card buttons.
+// Returns "" on any resolution failure — callers omit the button.
+func larkBuildIssueURL(ctx context.Context, queries *db.Queries, issueID string) string {
+	issueUUID, err := util.ParseUUID(issueID)
+	if err != nil {
+		return ""
+	}
+	issue, err := queries.GetIssue(ctx, issueUUID)
+	if err != nil {
+		return ""
+	}
+	ws, err := queries.GetWorkspace(ctx, issue.WorkspaceID)
+	if err != nil {
+		return ""
+	}
+	frontend := strings.TrimRight(strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN")), "/")
+	if frontend == "" {
+		frontend = "http://localhost:3000"
+	}
+	return fmt.Sprintf("%s/%s/issues/%s-%d", frontend, ws.Slug, ws.IssuePrefix, issue.Number)
 }
 
 // larkIssueInfo projects an IssueResponse into the slug-aware IssueInfo

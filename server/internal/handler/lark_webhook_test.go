@@ -630,7 +630,7 @@ func TestLarkThread_MirrorAgentComment_RepliesIntoThread(t *testing.T) {
 		t.Fatalf("scan issue uuid: %v", err)
 	}
 	testHandler.LarkThread.MirrorAgentCommentToThread(context.Background(), issueUUID, "CodexBot",
-		"Should this column be UUID or ULID?")
+		"Should this column be UUID or ULID?", "")
 
 	if !strings.HasSuffix(capturedPath, "/im/v1/messages/"+rootMsgID+"/reply") {
 		t.Fatalf("reply went to %q, want anchor on root message id", capturedPath)
@@ -688,7 +688,7 @@ func TestLarkThread_MirrorAgentComment_NoLinkRowSilentNoop(t *testing.T) {
 	if err := issueUUID.Scan(issueID); err != nil {
 		t.Fatalf("scan issue uuid: %v", err)
 	}
-	testHandler.LarkThread.MirrorAgentCommentToThread(context.Background(), issueUUID, "bot", "hello")
+	testHandler.LarkThread.MirrorAgentCommentToThread(context.Background(), issueUUID, "bot", "hello", "")
 
 	if calls != 0 {
 		t.Fatalf("expected no reply calls for unlinked issue, got %d", calls)
