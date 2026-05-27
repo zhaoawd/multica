@@ -40,7 +40,6 @@ import (
 const (
 	larkAPIBase             = "https://open.feishu.cn/open-apis"
 	larkTokenPath           = "/auth/v3/tenant_access_token/internal"
-	larkSendMessagePath     = "/im/v1/messages?receive_id_type=chat_id"
 	larkReplyMessagePath    = "/im/v1/messages/%s/reply"
 	larkListMessagesPath    = "/im/v1/messages"
 	larkAuthorizeURL        = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
@@ -190,18 +189,30 @@ func (c *LarkClient) tenantAccessToken(ctx context.Context) (string, error) {
 // The card argument is the JSON-serialisable card structure per Lark's
 // "message-card" spec. Returns an error if the API call fails.
 func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, card any) error {
-	if !c.cfg.Configured() {
-		return errors.New("lark not configured")
-	}
 	if chatID == "" {
 		return errors.New("chat_id required")
+	}
+	return c.sendCard(ctx, "chat_id", chatID, card)
+}
+
+// SendInteractiveCardToUser posts an interactive card to a user's DM by open_id.
+func (c *LarkClient) SendInteractiveCardToUser(ctx context.Context, openID string, card any) error {
+	if openID == "" {
+		return errors.New("open_id required")
+	}
+	return c.sendCard(ctx, "open_id", openID, card)
+}
+
+func (c *LarkClient) sendCard(ctx context.Context, receiveIDType, receiveID string, card any) error {
+	if !c.cfg.Configured() {
+		return errors.New("lark not configured")
 	}
 	cardBytes, err := json.Marshal(card)
 	if err != nil {
 		return err
 	}
 	payload := map[string]string{
-		"receive_id": chatID,
+		"receive_id": receiveID,
 		"msg_type":   "interactive",
 		"content":    string(cardBytes),
 	}
@@ -213,7 +224,8 @@ func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, car
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiBase+larkSendMessagePath, bytes.NewReader(body))
+	endpoint := c.apiBase + "/im/v1/messages?receive_id_type=" + receiveIDType
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

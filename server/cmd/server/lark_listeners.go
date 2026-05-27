@@ -29,10 +29,15 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 		return
 	}
 
-	// issue:created → "new issue" card with Claim/View button.
+	// issue:created → routed card (team claim or assignee DM).
+	// Skip issues created from a Lark thread — the thread service
+	// already posts a confirmation reply into the originating thread.
 	bus.Subscribe(protocol.EventIssueCreated, func(e events.Event) {
 		payload, ok := e.Payload.(map[string]any)
 		if !ok {
+			return
+		}
+		if src, _ := payload["source"].(string); src == "lark_thread" {
 			return
 		}
 		issue, ok := extractIssueFields(payload["issue"])
@@ -42,8 +47,13 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 		ctx := context.Background()
 		info := larkIssueInfo(ctx, notify, queries, issue)
 		hasAssignee := issue.AssigneeID != nil && *issue.AssigneeID != ""
+		assigneeUserID := ""
+		if hasAssignee {
+			assigneeUserID = *issue.AssigneeID
+		}
+		hasLarkIssueLink := larkHasIssueLink(ctx, queries, info.IssueID)
 		creator := larkActorName(ctx, queries, issue.CreatorType, issue.CreatorID)
-		notify.NotifyIssueCreated(ctx, issue.WorkspaceID, info, hasAssignee, creator)
+		notify.NotifyIssueCreated(ctx, issue.WorkspaceID, info, hasAssignee, assigneeUserID, hasLarkIssueLink, creator)
 	})
 
 	// issue:updated → "assigned" card on assignee change.
@@ -73,7 +83,7 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 			assigneeType = *issue.AssigneeType
 		}
 		name := larkActorName(ctx, queries, assigneeType, *issue.AssigneeID)
-		notify.NotifyIssueAssigned(ctx, issue.WorkspaceID, info, name)
+		notify.NotifyIssueAssigned(ctx, issue.WorkspaceID, info, name, *issue.AssigneeID)
 	})
 
 	// task:completed and task:failed share the same payload shape (see
@@ -331,4 +341,19 @@ func larkActorName(ctx context.Context, queries *db.Queries, actorType, actorID 
 		return agent.Name
 	}
 	return ""
+}
+
+// larkHasIssueLink checks whether an issue has a lark_issue_link row
+// (i.e. it was created from a Lark thread). Used to populate
+// LarkRoutingConditions.HasLarkIssueLink.
+func larkHasIssueLink(ctx context.Context, queries *db.Queries, issueID string) bool {
+	if issueID == "" {
+		return false
+	}
+	id, err := util.ParseUUID(issueID)
+	if err != nil {
+		return false
+	}
+	_, err = queries.GetLarkIssueLinkByIssueID(ctx, id)
+	return err == nil
 }

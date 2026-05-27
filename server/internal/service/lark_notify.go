@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -53,14 +53,23 @@ type LarkNotify struct {
 	sendTimeout time.Duration
 }
 
+// larkSendMode distinguishes team-chat sends from personal DM sends.
+type larkSendMode string
+
+const (
+	larkSendChat larkSendMode = "chat"
+	larkSendDM   larkSendMode = "dm"
+)
+
 // larkJob is what the bus goroutine enqueues for workers to dispatch.
-// We capture the rendered card + chat_id, not a closure over the binding
+// We capture the rendered card + target, not a closure over the binding
 // row, so the worker doesn't pin queries / context past dispatch().
 type larkJob struct {
-	chatID string
-	card   any
-	event  string
-	wsID   string
+	targetID string       // chat_id for team sends, open_id for DM sends
+	sendMode larkSendMode // which LarkClient method to call
+	card     any
+	event    string
+	wsID     string
 }
 
 const (
@@ -150,8 +159,15 @@ func (n *LarkNotify) runWorker() {
 			return
 		case job := <-n.jobs:
 			ctx, cancel := context.WithTimeout(context.Background(), n.sendTimeout)
-			if err := n.client.SendInteractiveCard(ctx, job.chatID, job.card); err != nil {
-				n.log.Warn("lark: send failed", "event", job.event, "ws", job.wsID, "err", err)
+			var err error
+			switch job.sendMode {
+			case larkSendDM:
+				err = n.client.SendInteractiveCardToUser(ctx, job.targetID, job.card)
+			default:
+				err = n.client.SendInteractiveCard(ctx, job.targetID, job.card)
+			}
+			if err != nil {
+				n.log.Warn("lark: send failed", "event", job.event, "ws", job.wsID, "mode", job.sendMode, "err", err)
 			}
 			cancel()
 		}
@@ -191,14 +207,20 @@ func (n *LarkNotify) IssueURL(info IssueInfo) string {
 	return fmt.Sprintf("%s/%s/issues/%s", n.frontend, info.WorkspaceSlug, info.Identifier)
 }
 
-// NotifyIssueCreated emits an "issue created" card. For unassigned issues
-// with a known UUID we also wire a Claim action button — clicking it
-// round-trips through `POST /api/webhooks/lark` and sets the assignee to
-// the (linked) clicker. Assigned issues or issues with missing IDs
-// fall back to a plain View button. In websocket mode the Claim button
-// is suppressed because card callbacks cannot flow over the WS transport.
-func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, creatorName string) {
-	n.dispatch(ctx, workspaceID, protocol.EventIssueCreated, func() any {
+// NotifyIssueCreated emits an "issue created" card. Routing: unassigned
+// issues go to the team chat (claim card); assigned issues go to the
+// assignee's DM (falls back to team chat if the user hasn't linked Lark).
+// Thread-linked issues route to thread_reply (handled by LarkThreadService).
+func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, assigneeUserID string, hasLarkIssueLink bool, creatorName string) {
+	cond := LarkRoutingConditions{
+		Event:            protocol.EventIssueCreated,
+		HasAssignee:      hasAssignee,
+		HasLarkIssueLink: hasLarkIssueLink,
+	}
+	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueCreated, assigneeUserID, cond, func(ch LarkChannel) any {
+		if ch == LarkChannelDM && hasAssignee {
+			return n.buildIssueAssignedCard(info, "")
+		}
 		return n.buildIssueCreatedCard(info, hasAssignee, creatorName)
 	})
 }
@@ -222,13 +244,15 @@ func (n *LarkNotify) buildIssueCreatedCard(info IssueInfo, hasAssignee bool, cre
 }
 
 // NotifyIssueAssigned emits an "issue assigned" card on assignee change.
-// assigneeName is best-effort — empty string just omits the line. The
-// card also carries a "Mark Done" action button so the assignee can
-// close the issue straight from Lark (the webhook resolves the clicker
-// via lark_user_link and applies the status change). In websocket mode
-// the button is suppressed — see NotifyIssueCreated.
-func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string, info IssueInfo, assigneeName string) {
-	n.dispatch(ctx, workspaceID, protocol.EventIssueUpdated, func() any {
+// Routing: always goes to the assignee's DM (falls back to team chat if
+// the user hasn't linked Lark).
+func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string, info IssueInfo, assigneeName string, assigneeUserID string) {
+	cond := LarkRoutingConditions{
+		Event:           protocol.EventIssueUpdated,
+		HasAssignee:     true,
+		AssigneeChanged: true,
+	}
+	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueUpdated, assigneeUserID, cond, func(_ LarkChannel) any {
 		return n.buildIssueAssignedCard(info, assigneeName)
 	})
 }
@@ -301,11 +325,6 @@ func (n *LarkNotify) dispatch(ctx context.Context, workspaceID string, eventKind
 	if !n.cfg.Configured() {
 		return
 	}
-	// Stop() flips this BEFORE close(stopCh) so a bus goroutine that
-	// observed started=true a moment ago doesn't try to send on a queue
-	// whose readers have already exited. The check is best-effort (no
-	// memory barrier between dispatch and Stop), but combined with the
-	// non-blocking select below the worst case is a single dropped card.
 	if n.stopping.Load() {
 		return
 	}
@@ -324,24 +343,101 @@ func (n *LarkNotify) dispatch(ctx context.Context, workspaceID string, eventKind
 		return
 	}
 	card := build()
-	job := larkJob{chatID: binding.ChatID, card: card, event: eventKind, wsID: workspaceID}
+	job := larkJob{targetID: binding.ChatID, sendMode: larkSendChat, card: card, event: eventKind, wsID: workspaceID}
+	n.enqueue(ctx, job)
+}
 
-	// Pre-Start (e.g. unit test) or unconfigured deployments: workers
-	// never ran, so the channel will block forever. In that case do the
-	// send inline so tests can assert on it deterministically. Otherwise
-	// enqueue non-blocking — Lark outages get dropped, not back-pressured.
+// dispatchRouted uses RouteLarkEvent to decide where to send the card.
+// For DM sends it looks up the assignee's lark_open_id; if the user
+// hasn't linked their Lark account, falls back to team chat.
+// The build function receives the target channel so callers can select
+// the appropriate card template per destination.
+func (n *LarkNotify) dispatchRouted(ctx context.Context, workspaceID string, eventKind string, assigneeUserID string, cond LarkRoutingConditions, build func(LarkChannel) any) {
+	if !n.cfg.Configured() {
+		return
+	}
+	if n.stopping.Load() {
+		return
+	}
+	wsUUID, err := util.ParseUUID(workspaceID)
+	if err != nil {
+		return
+	}
+	binding, err := n.queries.GetLarkWorkspaceBinding(ctx, wsUUID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			n.log.Warn("lark: binding lookup failed", "ws", workspaceID, "err", err)
+		}
+		return
+	}
+	if binding.ChatID == "" || !sliceContains(binding.EnabledEvents, eventKind) {
+		return
+	}
+
+	decision := RouteLarkEvent(cond)
+	if len(decision.Channels) == 0 {
+		return
+	}
+
+	for _, ch := range decision.Channels {
+		card := build(ch)
+		switch ch {
+		case LarkChannelTeam:
+			n.enqueue(ctx, larkJob{targetID: binding.ChatID, sendMode: larkSendChat, card: card, event: eventKind, wsID: workspaceID})
+
+		case LarkChannelDM:
+			openID := n.resolveAssigneeLarkOpenID(ctx, assigneeUserID)
+			if openID == "" {
+				n.enqueue(ctx, larkJob{targetID: binding.ChatID, sendMode: larkSendChat, card: card, event: eventKind, wsID: workspaceID})
+			} else {
+				n.enqueue(ctx, larkJob{targetID: openID, sendMode: larkSendDM, card: card, event: eventKind, wsID: workspaceID})
+			}
+
+		case LarkChannelThreadReply:
+			// Thread replies are handled by LarkThreadService separately.
+		}
+	}
+}
+
+// resolveAssigneeLarkOpenID looks up the Lark open_id for a multica user UUID.
+// Returns "" if the user hasn't linked or the ID is invalid.
+func (n *LarkNotify) resolveAssigneeLarkOpenID(ctx context.Context, userID string) string {
+	if userID == "" {
+		return ""
+	}
+	uuid, err := util.ParseUUID(userID)
+	if err != nil {
+		return ""
+	}
+	link, err := n.queries.GetLarkUserLink(ctx, uuid)
+	if err != nil {
+		return ""
+	}
+	return link.LarkOpenID
+}
+
+// enqueue puts a job onto the worker channel. When workers haven't started
+// (tests, unconfigured) it sends inline. When the queue is full it drops.
+func (n *LarkNotify) enqueue(ctx context.Context, job larkJob) {
 	if !n.started.Load() {
-		send_ctx, cancel := context.WithTimeout(ctx, n.sendTimeout)
+		sendCtx, cancel := context.WithTimeout(ctx, n.sendTimeout)
 		defer cancel()
-		if err := n.client.SendInteractiveCard(send_ctx, job.chatID, job.card); err != nil {
-			n.log.Warn("lark: send failed", "event", job.event, "ws", job.wsID, "err", err)
+		var err error
+		switch job.sendMode {
+		case larkSendDM:
+			err = n.client.SendInteractiveCardToUser(sendCtx, job.targetID, job.card)
+		default:
+			err = n.client.SendInteractiveCard(sendCtx, job.targetID, job.card)
+		}
+		if err != nil {
+			n.log.Warn("lark: send failed", "event", job.event, "ws", job.wsID, "mode", job.sendMode, "err", err)
 		}
 		return
 	}
 	select {
 	case n.jobs <- job:
 	default:
-		n.log.Warn("lark: queue full, dropping event", "event", eventKind, "ws", workspaceID)
+		n.log.Warn("lark: queue full, dropping event", "event", job.event, "ws", job.wsID)
 	}
 }
 
