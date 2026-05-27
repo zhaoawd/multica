@@ -190,6 +190,22 @@ The [GitHub PR ↔ issue integration](/github-integration) needs two variables. 
 
 **Note:** `GITHUB_WEBHOOK_SECRET` is reused as the signing key for the install-flow state token, so operators only need to manage one secret. It is **not** the GitHub App's *Client* secret — Client secrets are OAuth-related and not used by this integration. See [GitHub integration → Self-host setup](/github-integration#self-host-setup) for the full walkthrough.
 
+## Lark integration
+
+The [Lark (Feishu) integration](/lark-integration) routes Multica events between a team group chat and personal DMs. All four `LARK_*` variables must be set, otherwise the integration is silently disabled.
+
+| Variable | Default | Description |
+|---|---|---|
+| `LARK_APP_ID` | empty | Lark app's App ID (`cli_xxxxx` format), from the app's Credentials & Basic Info page |
+| `LARK_APP_SECRET` | empty | Lark app's App Secret |
+| `LARK_VERIFICATION_TOKEN` | empty | Verification Token from the Event Subscriptions page; verifies inbound webhooks and signs OAuth state HMAC |
+| `LARK_ENCRYPT_KEY` | empty | Encrypt Key from the Event Subscriptions page; decrypts inbound event payloads and encrypts bot tokens at rest |
+| `LARK_CALLBACK_MODE` | `webhook` | Callback mode: `websocket` (long connection, no public URL needed) or `webhook` (default, requires a public callback URL) |
+
+**When any of the four core variables are missing:** the Lark config UI in Settings shows "not configured", event listeners do not fire, and the notifier no-ops — zero overhead.
+
+See [Lark integration → Self-host setup](/lark-integration#self-host-setup) for the full walkthrough.
+
 ## Usage analytics
 
 By default, the server reports to Multica's official PostHog instance. To opt out, set `ANALYTICS_DISABLED=true`.

@@ -1,0 +1,162 @@
+---
+title: 飞书集成
+description: 把飞书群和个人私聊接入 Multica——团队群承载需求讨论和公共信号，个人私聊承载行动队列。支持 @bot 创建任务、卡片按钮认领/完成、agent 澄清桥。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+飞书集成把 Multica 的事件分流到两个通道：
+
+- **团队群**：未分配任务的认领卡片、公共阻塞、thread → issue 闭环
+- **个人私聊**：已分配任务通知、agent 澄清提问、可选的 task 完成/失败
+
+路由原则：**团队群只放需要团队共同注意的信号；个人私聊放需要某个人行动的信号。**
+
+## 集成做了什么
+
+| 场景 | 行为 |
+|---|---|
+| **Issue 创建，无 assignee** | 团队群收到认领卡片（带 Claim 按钮） |
+| **Issue 创建/分配给某人** | 该用户飞书私聊收到 assigned 卡片（带 Mark Done 按钮）；如果用户未绑定飞书，fallback 到团队群 |
+| **Issue 来自飞书 thread** | 回贴原 thread 确认，不重复推群 |
+| **Task 失败，无 assignee** | 团队群收到公共阻塞卡片 |
+| **Task 失败/完成，有 assignee** | 个人私聊（默认关闭，用户可开启） |
+| **Agent 澄清** | 如果 issue 有 thread 链接，回贴 thread；否则推个人私聊 |
+| **@bot 创建任务** | 飞书群里 @机器人 + 结构化指令，自动创建 issue |
+| **卡片按钮** | 点击「认领」「Mark Done」等按钮直接操作 issue |
+
+## 通知路由规则
+
+| Multica 事件 | 团队群 | 个人私聊 |
+|---|---|---|
+| `issue:created`，无 assignee，无 thread | 认领卡片 | — |
+| `issue:created`，有 assignee | — | assigned 卡片 |
+| `issue:created`，来自 Lark thread | 回贴原 thread | — |
+| `issue:updated`，assignee 变化 | — | 通知新 assignee |
+| `task:completed` | — | 通知 assignee（默认关） |
+| `task:failed`，无 assignee | 公共阻塞卡片 | — |
+| `task:failed`，有 assignee | — | 通知 assignee（默认关） |
+| `comment:created`，clarification | 回贴 thread（如有）| 通知 assignee（如无 thread） |
+| `comment:created`，@mention | — | 通知被 mention 的人（默认关） |
+
+<Callout type="info">
+Agent 类型的 assignee 没有飞书账号，通知会 fallback 到团队群。
+</Callout>
+
+## 回调模式
+
+飞书集成支持两种回调模式：
+
+| 模式 | 适用场景 | 配置 |
+|---|---|---|
+| **WebSocket**（推荐） | 本地开发、内网部署、无公网 IP | `LARK_CALLBACK_MODE=websocket` |
+| **Webhook** | 有公网可达的回调地址 | `LARK_CALLBACK_MODE=webhook`（默认） |
+
+WebSocket 模式下，server 启动时主动连接飞书长连接服务，不需要公网回调地址。日志里看到 `lark websocket: connected and ready` 表示连接成功。
+
+<Callout type="warn">
+WebSocket 模式下卡片按钮回调（Claim、Mark Done）仍然走 HTTP——飞书 SDK 的 WS 客户端不转发 card action 事件。如果需要卡片按钮功能，仍需配置 webhook URL。
+</Callout>
+
+## Self-Host 配置
+
+如果你在 Multica Cloud 上，集成已经配好——跳过本节。
+
+### 1. 创建飞书应用
+
+到 [飞书开放平台](https://open.feishu.cn/app) 创建一个**企业自建应用**。
+
+### 2. 配置应用权限
+
+在应用的「权限管理」页面开启：
+
+| 权限 | 用途 |
+|---|---|
+| `im:message` | 接收群消息（@bot 指令） |
+| `im:message:send_as_bot` | 发送消息到群和个人 |
+| `im:resource` | 下载消息中的图片/文件附件 |
+| `contact:user.id:readonly` | OAuth 获取用户 open_id |
+
+### 3. 配置事件订阅
+
+在应用的「事件订阅」页面：
+
+- **WebSocket 模式**：选择「使用长连接接收事件」
+- **Webhook 模式**：填入回调地址 `https://<api-host>/api/webhooks/lark`
+
+订阅事件：`im.message.receive_v1`（接收消息）
+
+### 4. 配置环境变量
+
+从应用的「凭证与基础信息」页面获取以下值，填入 `.env`：
+
+```bash
+LARK_APP_ID=cli_xxxxx              # App ID
+LARK_APP_SECRET=xxxxx              # App Secret
+LARK_VERIFICATION_TOKEN=xxxxx      # 事件订阅页面的 Verification Token
+LARK_ENCRYPT_KEY=xxxxx             # 事件订阅页面的 Encrypt Key
+LARK_CALLBACK_MODE=websocket       # 或 webhook
+```
+
+### 5. 发布应用
+
+在「版本管理与发布」里创建版本并发布。确保应用的可用范围包含需要收到 DM 的用户。
+
+### 6. 启动 server
+
+```bash
+make server
+```
+
+WebSocket 模式下日志会输出：
+```
+lark websocket: connected and ready
+```
+
+## 绑定工作区
+
+1. 在 Multica 的 **Settings → Lark** 里点击「绑定群聊」
+2. 把机器人添加到目标飞书群
+3. 选择要推送的事件类型
+
+绑定后，该群会收到对应事件的通知卡片。
+
+## 用户绑定飞书账号
+
+每个想收个人私聊通知的用户需要一次性绑定飞书：
+
+1. 进入 **Settings → Profile → Lark** 或点击「连接飞书」
+2. 跳转飞书授权页面，同意授权
+3. 回调完成，`lark_user_link` 记录建立
+
+绑定后，分配给该用户的 issue 通知会推到个人私聊而不是群。
+
+<Callout type="info">
+未绑定飞书的用户不会丢消息——通知会 fallback 到团队群。绑定只是让路由更精准。
+</Callout>
+
+## 个人通知偏好
+
+绑定飞书后，用户可以在设置里调整哪些事件推私聊：
+
+| 偏好 | 默认 | 说明 |
+|---|---|---|
+| Assigned DM | 开 | issue 分配给我时推私聊 |
+| Agent Clarification DM | 开 | agent 提问时推私聊 |
+| Task Failed DM | 关 | task 失败时推私聊 |
+| Task Completed DM | 关 | task 完成时推私聊 |
+| Mention DM | 关 | 被 @mention 时推私聊 |
+
+## @bot 指令
+
+在飞书群里 @机器人 可以执行结构化操作：
+
+| 指令 | 效果 |
+|---|---|
+| `@bot 创建任务 <标题>` | 从当前 thread 创建 issue，thread 内容作为描述 |
+| `@bot whoami` | 查看当前绑定状态 |
+
+## 断开连接
+
+- **解绑工作区群**：Settings → Lark → 解绑。已发送的卡片保留，新事件不再推送
+- **解绑个人飞书**：Settings → Profile → Lark → Disconnect。通知回退到团队群

@@ -29,6 +29,7 @@
     "inbox",
     "---集成---",
     "github-integration",
+    "lark-integration",
     "---自部署运维---",
     "environment-variables",
     "auth-setup",

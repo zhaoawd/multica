@@ -1,0 +1,160 @@
+---
+title: Lark Integration
+description: Connect Lark (Feishu) group chats and personal DMs to Multica — team chats carry unassigned tasks and public signals, personal DMs carry individual action queues. Supports @bot issue creation, card button actions, and agent clarification bridging.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+The Lark integration routes Multica events to two channels:
+
+- **Team chat**: unassigned task claim cards, public blockers, thread → issue loop
+- **Personal DM**: assigned task notifications, agent clarification questions, optional task completed/failed
+
+Routing principle: **team chat only gets signals the whole team needs to act on; personal DM gets signals a specific person needs to act on.**
+
+## What the integration does
+
+| Scenario | Behavior |
+|---|---|
+| **Issue created, no assignee** | Team chat receives a claim card (with Claim button) |
+| **Issue created/assigned to someone** | That user's Lark DM receives an assigned card (with Mark Done button); falls back to team chat if the user hasn't linked Lark |
+| **Issue created from a Lark thread** | Replies into the originating thread — does not duplicate to team chat |
+| **Task failed, no assignee** | Team chat receives a public blocker card |
+| **Task failed/completed, has assignee** | Personal DM (off by default, user can enable) |
+| **Agent clarification** | Replies into thread if issue has a thread link; otherwise personal DM |
+| **@bot create task** | @mention the bot in a Lark group with a structured command to create an issue |
+| **Card buttons** | Click Claim, Mark Done, etc. to operate on issues directly from Lark |
+
+## Notification routing rules
+
+| Multica event | Team chat | Personal DM |
+|---|---|---|
+| `issue:created`, no assignee, no thread | Claim card | — |
+| `issue:created`, has assignee | — | Assigned card |
+| `issue:created`, from Lark thread | Reply into thread | — |
+| `issue:updated`, assignee changed | — | Notify new assignee |
+| `task:completed` | — | Notify assignee (off by default) |
+| `task:failed`, no assignee | Public blocker card | — |
+| `task:failed`, has assignee | — | Notify assignee (off by default) |
+| `comment:created`, clarification | Reply into thread (if exists) | Notify assignee (if no thread) |
+| `comment:created`, @mention | — | Notify mentioned user (off by default) |
+
+<Callout type="info">
+Agent-type assignees don't have Lark accounts — notifications fall back to the team chat.
+</Callout>
+
+## Callback modes
+
+| Mode | Best for | Config |
+|---|---|---|
+| **WebSocket** (recommended) | Local dev, private networks, no public IP | `LARK_CALLBACK_MODE=websocket` |
+| **Webhook** | Publicly reachable server | `LARK_CALLBACK_MODE=webhook` (default) |
+
+In WebSocket mode the server opens a long-lived connection to Lark on startup — no public callback URL needed. You'll see `lark websocket: connected and ready` in the logs when connected.
+
+<Callout type="warn">
+Card button callbacks (Claim, Mark Done) still go through HTTP even in WebSocket mode — the Lark SDK's WS client does not forward card action events. If you need card buttons, you still need to configure a webhook URL.
+</Callout>
+
+## Self-host setup
+
+If you're on Multica Cloud, the integration is already configured — skip this section.
+
+### 1. Create a Lark app
+
+Go to the [Lark Open Platform](https://open.feishu.cn/app) and create an **in-house app**.
+
+### 2. Configure permissions
+
+Under the app's **Permission Management** page, enable:
+
+| Permission | Purpose |
+|---|---|
+| `im:message` | Receive group messages (@bot commands) |
+| `im:message:send_as_bot` | Send messages to groups and individuals |
+| `im:resource` | Download image/file attachments from messages |
+| `contact:user.id:readonly` | Get user open_id via OAuth |
+
+### 3. Configure event subscription
+
+Under the app's **Event Subscriptions** page:
+
+- **WebSocket mode**: select "Use long connection to receive events"
+- **Webhook mode**: enter the callback URL `https://<api-host>/api/webhooks/lark`
+
+Subscribe to event: `im.message.receive_v1`
+
+### 4. Set environment variables
+
+Get the following from the app's **Credentials & Basic Info** page and add to `.env`:
+
+```bash
+LARK_APP_ID=cli_xxxxx              # App ID
+LARK_APP_SECRET=xxxxx              # App Secret
+LARK_VERIFICATION_TOKEN=xxxxx      # Verification Token from Event Subscriptions page
+LARK_ENCRYPT_KEY=xxxxx             # Encrypt Key from Event Subscriptions page
+LARK_CALLBACK_MODE=websocket       # or webhook
+```
+
+### 5. Publish the app
+
+Create a version and publish under **Version Management & Release**. Make sure the app's availability scope includes all users who should receive DMs.
+
+### 6. Start the server
+
+```bash
+make server
+```
+
+In WebSocket mode you'll see:
+```
+lark websocket: connected and ready
+```
+
+## Bind a workspace
+
+1. Go to **Settings → Lark** and click "Bind group chat"
+2. Add the bot to the target Lark group
+3. Select which event types to push
+
+Once bound, the group receives notification cards for the selected events.
+
+## Link your Lark account
+
+Each user who wants personal DM notifications needs to link their Lark account once:
+
+1. Go to **Settings → Profile → Lark** or click "Connect Lark"
+2. Authorize on the Lark page
+3. The callback completes and a `lark_user_link` record is created
+
+After linking, issues assigned to that user will route to their personal DM instead of the team chat.
+
+<Callout type="info">
+Users who haven't linked Lark won't miss notifications — they fall back to the team chat. Linking just makes routing more precise.
+</Callout>
+
+## Personal notification preferences
+
+After linking Lark, users can adjust which events push to their DM:
+
+| Preference | Default | Description |
+|---|---|---|
+| Assigned DM | On | Push DM when an issue is assigned to me |
+| Agent Clarification DM | On | Push DM when an agent asks a clarification question |
+| Task Failed DM | Off | Push DM when a task I own fails |
+| Task Completed DM | Off | Push DM when a task I own completes |
+| Mention DM | Off | Push DM when I'm @mentioned in a comment |
+
+## @bot commands
+
+@mention the bot in a Lark group to run structured operations:
+
+| Command | Effect |
+|---|---|
+| `@bot 创建任务 <title>` | Create an issue from the current thread, using thread content as description |
+| `@bot whoami` | Check your current link status |
+
+## Disconnect
+
+- **Unbind workspace group**: Settings → Lark → Unbind. Sent cards are preserved; new events stop being pushed.
+- **Unlink personal Lark**: Settings → Profile → Lark → Disconnect. Notifications fall back to the team chat.
