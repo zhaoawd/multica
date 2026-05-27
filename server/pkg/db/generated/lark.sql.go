@@ -74,7 +74,7 @@ func (q *Queries) GetLarkIssueLinkByRootMessage(ctx context.Context, rootMessage
 
 const getLarkUserLink = `-- name: GetLarkUserLink :one
 
-SELECT user_id, lark_open_id, refresh_token_enc, linked_at FROM lark_user_link
+SELECT user_id, lark_open_id, refresh_token_enc, linked_at, prefs FROM lark_user_link
 WHERE user_id = $1
 `
 
@@ -89,12 +89,13 @@ func (q *Queries) GetLarkUserLink(ctx context.Context, userID pgtype.UUID) (Lark
 		&i.LarkOpenID,
 		&i.RefreshTokenEnc,
 		&i.LinkedAt,
+		&i.Prefs,
 	)
 	return i, err
 }
 
 const getLarkUserLinkByOpenID = `-- name: GetLarkUserLinkByOpenID :one
-SELECT user_id, lark_open_id, refresh_token_enc, linked_at FROM lark_user_link
+SELECT user_id, lark_open_id, refresh_token_enc, linked_at, prefs FROM lark_user_link
 WHERE lark_open_id = $1
 `
 
@@ -106,8 +107,20 @@ func (q *Queries) GetLarkUserLinkByOpenID(ctx context.Context, larkOpenID string
 		&i.LarkOpenID,
 		&i.RefreshTokenEnc,
 		&i.LinkedAt,
+		&i.Prefs,
 	)
 	return i, err
+}
+
+const getLarkUserPrefs = `-- name: GetLarkUserPrefs :one
+SELECT prefs FROM lark_user_link WHERE user_id = $1
+`
+
+func (q *Queries) GetLarkUserPrefs(ctx context.Context, userID pgtype.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getLarkUserPrefs, userID)
+	var prefs []byte
+	err := row.Scan(&prefs)
+	return prefs, err
 }
 
 const getLarkWorkspaceBinding = `-- name: GetLarkWorkspaceBinding :one
@@ -236,6 +249,31 @@ func (q *Queries) MarkLarkBindingPermWarning(ctx context.Context, workspaceID pg
 	return err
 }
 
+const updateLarkUserPrefs = `-- name: UpdateLarkUserPrefs :one
+UPDATE lark_user_link
+SET prefs = $2
+WHERE user_id = $1
+RETURNING user_id, lark_open_id, refresh_token_enc, linked_at, prefs
+`
+
+type UpdateLarkUserPrefsParams struct {
+	UserID pgtype.UUID `json:"user_id"`
+	Prefs  []byte      `json:"prefs"`
+}
+
+func (q *Queries) UpdateLarkUserPrefs(ctx context.Context, arg UpdateLarkUserPrefsParams) (LarkUserLink, error) {
+	row := q.db.QueryRow(ctx, updateLarkUserPrefs, arg.UserID, arg.Prefs)
+	var i LarkUserLink
+	err := row.Scan(
+		&i.UserID,
+		&i.LarkOpenID,
+		&i.RefreshTokenEnc,
+		&i.LinkedAt,
+		&i.Prefs,
+	)
+	return i, err
+}
+
 const updateLarkWorkspaceBindingEvents = `-- name: UpdateLarkWorkspaceBindingEvents :one
 UPDATE lark_workspace_binding
 SET enabled_events = $2,
@@ -274,7 +312,7 @@ ON CONFLICT (user_id) DO UPDATE SET
     lark_open_id      = EXCLUDED.lark_open_id,
     refresh_token_enc = EXCLUDED.refresh_token_enc,
     linked_at         = now()
-RETURNING user_id, lark_open_id, refresh_token_enc, linked_at
+RETURNING user_id, lark_open_id, refresh_token_enc, linked_at, prefs
 `
 
 type UpsertLarkUserLinkParams struct {
@@ -291,6 +329,7 @@ func (q *Queries) UpsertLarkUserLink(ctx context.Context, arg UpsertLarkUserLink
 		&i.LarkOpenID,
 		&i.RefreshTokenEnc,
 		&i.LinkedAt,
+		&i.Prefs,
 	)
 	return i, err
 }

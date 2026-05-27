@@ -73,6 +73,15 @@ RETURNING *;
 -- name: DeleteLarkUserLink :exec
 DELETE FROM lark_user_link WHERE user_id = $1;
 
+-- name: GetLarkUserPrefs :one
+SELECT prefs FROM lark_user_link WHERE user_id = $1;
+
+-- name: UpdateLarkUserPrefs :one
+UPDATE lark_user_link
+SET prefs = $2
+WHERE user_id = $1
+RETURNING *;
+
 -- =====================
 -- Lark issue link (P4)
 -- =====================

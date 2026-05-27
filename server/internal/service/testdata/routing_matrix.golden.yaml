@@ -55,10 +55,25 @@ cases:
       event: issue:created
       has_assignee: true
       has_lark_issue_link: false
+      user_pref:
+        assigned_dm: true
     expected:
       channels: [dm]
       card: assigned_card
       must_not_channels: [team, thread_reply]
+
+  - name: issue_created_with_assignee_no_thread_pref_off
+    # Assignee opted out of assigned DM — silent.
+    conditions:
+      event: issue:created
+      has_assignee: true
+      has_lark_issue_link: false
+      user_pref:
+        assigned_dm: false
+    expected:
+      channels: []
+      card: assigned_card
+      must_not_channels: [team, dm, thread_reply]
 
   - name: issue_created_with_workspace_agent_no_thread
     # Workspace (cloud) agent assignee — no personal owner to DM,
@@ -80,10 +95,25 @@ cases:
       event: issue:created
       has_assignee: true
       has_lark_issue_link: true
+      user_pref:
+        assigned_dm: true
     expected:
       channels: [dm, thread_reply]
       card: created_confirmation
       must_not_channels: [team]
+
+  - name: issue_created_with_assignee_with_thread_pref_off
+    # Assignee opted out — thread still gets confirmation, but no DM.
+    conditions:
+      event: issue:created
+      has_assignee: true
+      has_lark_issue_link: true
+      user_pref:
+        assigned_dm: false
+    expected:
+      channels: [thread_reply]
+      card: created_confirmation
+      must_not_channels: [team, dm]
 
   - name: issue_created_with_workspace_agent_with_thread
     # Workspace agent + thread: thread gets confirmation, team gets
@@ -105,10 +135,25 @@ cases:
       event: issue:updated
       assignee_changed: true
       has_assignee: true
+      user_pref:
+        assigned_dm: true
     expected:
       channels: [dm]
       card: assigned_card
       must_not_channels: [team, thread_reply]
+
+  - name: issue_updated_assignee_changed_pref_off
+    # Assignee opted out of assigned DM — silent.
+    conditions:
+      event: issue:updated
+      assignee_changed: true
+      has_assignee: true
+      user_pref:
+        assigned_dm: false
+    expected:
+      channels: []
+      card: assigned_card
+      must_not_channels: [team, dm, thread_reply]
 
   - name: issue_updated_assignee_changed_workspace_agent
     # Workspace (cloud) agent — team chat, not DM.

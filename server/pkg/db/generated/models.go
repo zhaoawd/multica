@@ -419,6 +419,7 @@ type LarkUserLink struct {
 	LarkOpenID      string             `json:"lark_open_id"`
 	RefreshTokenEnc []byte             `json:"refresh_token_enc"`
 	LinkedAt        pgtype.Timestamptz `json:"linked_at"`
+	Prefs           []byte             `json:"prefs"`
 }
 
 type LarkWorkspaceBinding struct {

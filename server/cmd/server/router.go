@@ -368,6 +368,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Get("/api/users/me/lark/link", h.GetMyLarkUserLink)
 		r.Post("/api/users/me/lark/link", h.StartLarkUserLink)
 		r.Delete("/api/users/me/lark/link", h.DeleteMyLarkUserLink)
+		r.Get("/api/users/me/lark/prefs", h.GetMyLarkPrefs)
+		r.Patch("/api/users/me/lark/prefs", h.PatchMyLarkPrefs)
 		r.Post("/api/cli-token", h.IssueCliToken)
 		r.Post("/api/upload-file", h.UploadFile)
 		r.Post("/api/feedback", h.CreateFeedback)

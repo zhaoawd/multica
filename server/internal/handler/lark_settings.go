@@ -206,3 +206,67 @@ func filterSupportedEvents(in []string) []string {
 	}
 	return out
 }
+
+// ── Per-user Lark notification preferences ────────────────────────────
+
+// GetMyLarkPrefs returns the calling user's Lark DM preferences.
+func (h *Handler) GetMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
+	userID := requestUserID(r)
+	if userID == "" {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	userUUID, ok := parseUUIDOrBadRequest(w, userID, "user id")
+	if !ok {
+		return
+	}
+	raw, err := h.Queries.GetLarkUserPrefs(r.Context(), userUUID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusOK, service.DefaultLarkUserPref())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load prefs")
+		return
+	}
+	pref := service.DefaultLarkUserPref()
+	if len(raw) > 0 {
+		json.Unmarshal(raw, &pref)
+	}
+	writeJSON(w, http.StatusOK, pref)
+}
+
+// PatchMyLarkPrefs updates the calling user's Lark DM preferences.
+func (h *Handler) PatchMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
+	userID := requestUserID(r)
+	if userID == "" {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	userUUID, ok := parseUUIDOrBadRequest(w, userID, "user id")
+	if !ok {
+		return
+	}
+	var incoming service.LarkUserPref
+	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	prefsJSON, err := json.Marshal(incoming)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal prefs")
+		return
+	}
+	if _, err := h.Queries.UpdateLarkUserPrefs(r.Context(), db.UpdateLarkUserPrefsParams{
+		UserID: userUUID,
+		Prefs:  prefsJSON,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "lark account not linked")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to update prefs")
+		return
+	}
+	writeJSON(w, http.StatusOK, incoming)
+}

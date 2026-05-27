@@ -99,27 +99,27 @@ func IsLarkRoutableEvent(kind string) bool {
 type LarkUserPref struct {
 	// AssignedDM: receive a DM card when an issue is (re)assigned to
 	// this user. Default ON.
-	AssignedDM bool `yaml:"assigned_dm"`
+	AssignedDM bool `yaml:"assigned_dm" json:"assigned_dm"`
 
 	// AgentClarificationDM: receive a DM when an agent assigned to
 	// this user posts a clarification comment AND the issue has no
 	// lark_issue_link (no thread to reply into). Default ON.
-	AgentClarificationDM bool `yaml:"agent_clarification_dm"`
+	AgentClarificationDM bool `yaml:"agent_clarification_dm" json:"agent_clarification_dm"`
 
 	// TaskFailedDM: receive a DM when a task this user owns / created
 	// fails. Default OFF — daemon auto-retries, and continuous failures
 	// escalate via clarification.
-	TaskFailedDM bool `yaml:"task_failed_dm"`
+	TaskFailedDM bool `yaml:"task_failed_dm" json:"task_failed_dm"`
 
 	// TaskCompletedDM: receive a DM when a task this user owns / created
 	// completes. Default OFF — completion is usually checked via the
 	// multica UI, not pushed.
-	TaskCompletedDM bool `yaml:"task_completed_dm"`
+	TaskCompletedDM bool `yaml:"task_completed_dm" json:"task_completed_dm"`
 
 	// MentionDM: receive a DM when @-mentioned in a non-clarification
 	// comment. Default OFF — the multica web UI inbox is the canonical
 	// place for mentions.
-	MentionDM bool `yaml:"mention_dm"`
+	MentionDM bool `yaml:"mention_dm" json:"mention_dm"`
 }
 
 // DefaultLarkUserPref returns the pref a freshly-OAuthed user starts
@@ -243,21 +243,10 @@ func RouteLarkEvent(c LarkRoutingConditions) LarkRoutingDecision {
 		}
 		if c.HasAssignee {
 			if c.AssigneeIsWorkspaceAgent {
-				// Workspace (cloud) agents have no personal owner —
-				// the assignment is a team-visible signal.
 				channels = append(channels, LarkChannelTeam)
-			} else {
-				// Members and local (daemon) agents get a personal DM.
-				// For local agents the listener resolves the owner's
-				// user ID as the DM target.
+			} else if c.UserPref.AssignedDM {
 				channels = append(channels, LarkChannelDM)
 			}
-			// If both apply, the thread confirmation card takes the
-			// labelled slot — the DM card kind is implied by the
-			// presence of dm in Channels and the listener picks the
-			// right template per-channel. We don't model two card
-			// kinds per decision; keeping Card single-valued matches
-			// the design's "one card per signal" rule.
 			if card == LarkCardNone {
 				card = LarkCardAssigned
 			}
@@ -274,7 +263,7 @@ func RouteLarkEvent(c LarkRoutingConditions) LarkRoutingDecision {
 		if c.AssigneeChanged && c.HasAssignee {
 			if c.AssigneeIsWorkspaceAgent {
 				channels = append(channels, LarkChannelTeam)
-			} else {
+			} else if c.UserPref.AssignedDM {
 				channels = append(channels, LarkChannelDM)
 			}
 			card = LarkCardAssigned

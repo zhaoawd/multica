@@ -407,6 +407,9 @@ func (n *LarkNotify) dispatchRouted(ctx context.Context, workspaceID string, eve
 		return
 	}
 
+	if assigneeUserID != "" {
+		cond.UserPref = n.resolveLarkUserPref(ctx, assigneeUserID)
+	}
 	decision := RouteLarkEvent(cond)
 	if len(decision.Channels) == 0 {
 		return
@@ -447,6 +450,28 @@ func (n *LarkNotify) resolveAssigneeLarkOpenID(ctx context.Context, userID strin
 		return ""
 	}
 	return link.LarkOpenID
+}
+
+// resolveLarkUserPref loads the user's Lark notification preferences.
+// Returns DefaultLarkUserPref on any failure (user not linked, JSON
+// malformed, DB miss) so the routing function always gets a valid pref.
+func (n *LarkNotify) resolveLarkUserPref(ctx context.Context, userID string) LarkUserPref {
+	if userID == "" {
+		return DefaultLarkUserPref()
+	}
+	uuid, err := util.ParseUUID(userID)
+	if err != nil {
+		return DefaultLarkUserPref()
+	}
+	raw, err := n.queries.GetLarkUserPrefs(ctx, uuid)
+	if err != nil || len(raw) == 0 {
+		return DefaultLarkUserPref()
+	}
+	pref := DefaultLarkUserPref()
+	if err := json.Unmarshal(raw, &pref); err != nil {
+		return DefaultLarkUserPref()
+	}
+	return pref
 }
 
 // enqueue puts a job onto the worker channel. When workers haven't started
