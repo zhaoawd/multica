@@ -172,6 +172,13 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
     if (!title.trim() || submitting) return;
     setSubmitting(true);
     try {
+      // Flush any pending custom URL the user typed but didn't explicitly add.
+      const pendingUrl = customRepoUrl.trim();
+      const allRepos =
+        pendingUrl && !selectedRepos.includes(pendingUrl)
+          ? [...selectedRepos, pendingUrl]
+          : selectedRepos;
+
       const project = await createProject.mutateAsync({
         title: title.trim(),
         description: descEditorRef.current?.getMarkdown()?.trim() || undefined,
@@ -182,8 +189,8 @@ export function CreateProjectModal({ onClose }: { onClose: () => void }) {
         lead_id: leadId,
         // Server attaches these in the same transaction as the project.
         resources:
-          selectedRepos.length > 0
-            ? selectedRepos.map((url) => ({
+          allRepos.length > 0
+            ? allRepos.map((url) => ({
                 resource_type: "github_repo" as const,
                 resource_ref: { url },
               }))
