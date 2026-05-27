@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -70,6 +71,18 @@ type larkJob struct {
 	card     any
 	event    string
 	wsID     string
+	issueID  string
+	channel  LarkChannel
+	cardKind LarkCardKind
+
+	patchMessageID string
+	messageRefID   pgtype.UUID
+}
+
+type larkRenderedCard struct {
+	payload any
+	issueID string
+	kind    LarkCardKind
 }
 
 const (
@@ -159,16 +172,7 @@ func (n *LarkNotify) runWorker() {
 			return
 		case job := <-n.jobs:
 			ctx, cancel := context.WithTimeout(context.Background(), n.sendTimeout)
-			var err error
-			switch job.sendMode {
-			case larkSendDM:
-				err = n.client.SendInteractiveCardToUser(ctx, job.targetID, job.card)
-			default:
-				err = n.client.SendInteractiveCard(ctx, job.targetID, job.card)
-			}
-			if err != nil {
-				n.log.Warn("lark: send failed", "event", job.event, "ws", job.wsID, "mode", job.sendMode, "err", err)
-			}
+			n.processJob(ctx, job)
 			cancel()
 		}
 	}
@@ -216,16 +220,16 @@ func (n *LarkNotify) IssueURL(info IssueInfo) string {
 // Thread-linked issues route to thread_reply (handled by LarkThreadService).
 func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, assigneeUserID string, hasLarkIssueLink bool, assigneeIsWorkspaceAgent bool, creatorName string) {
 	cond := LarkRoutingConditions{
-		Event:                   protocol.EventIssueCreated,
-		HasAssignee:             hasAssignee,
-		HasLarkIssueLink:        hasLarkIssueLink,
+		Event:                    protocol.EventIssueCreated,
+		HasAssignee:              hasAssignee,
+		HasLarkIssueLink:         hasLarkIssueLink,
 		AssigneeIsWorkspaceAgent: assigneeIsWorkspaceAgent,
 	}
-	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueCreated, assigneeUserID, cond, func(ch LarkChannel) any {
-		if ch == LarkChannelDM && hasAssignee {
-			return n.buildIssueAssignedCard(info, "")
+	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueCreated, assigneeUserID, cond, func(ch LarkChannel) larkRenderedCard {
+		if hasAssignee {
+			return larkRenderedCard{payload: n.buildIssueAssignedCard(info, ""), issueID: info.IssueID, kind: LarkCardAssigned}
 		}
-		return n.buildIssueCreatedCard(info, hasAssignee, creatorName)
+		return larkRenderedCard{payload: n.buildIssueCreatedCard(info, hasAssignee, creatorName), issueID: info.IssueID, kind: LarkCardClaim}
 	})
 }
 
@@ -267,8 +271,8 @@ func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string
 		AssigneeChanged:          true,
 		AssigneeIsWorkspaceAgent: assigneeIsWorkspaceAgent,
 	}
-	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueUpdated, assigneeUserID, cond, func(_ LarkChannel) any {
-		return n.buildIssueAssignedCard(info, assigneeName)
+	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueUpdated, assigneeUserID, cond, func(_ LarkChannel) larkRenderedCard {
+		return larkRenderedCard{payload: n.buildIssueAssignedCard(info, assigneeName), issueID: info.IssueID, kind: LarkCardAssigned}
 	})
 }
 
@@ -298,6 +302,57 @@ func (n *LarkNotify) buildIssueAssignedCard(info IssueInfo, assigneeName string)
 	}
 	buttons = append(buttons, cardButton{Text: "View", URL: n.IssueURL(info)})
 	return buildCardWithElements(title, elements, buttons)
+}
+
+// PatchIssueTerminalCards updates active Lark cards for an issue once it
+// reaches a terminal state. The patched card keeps the View link but removes
+// write-action buttons such as Claim / Mark Done.
+func (n *LarkNotify) PatchIssueTerminalCards(ctx context.Context, workspaceID string, info IssueInfo) {
+	if !n.cfg.Configured() || n.stopping.Load() || n.queries == nil {
+		return
+	}
+	if info.IssueID == "" || !IsTerminalIssueStatus(info.Status) {
+		return
+	}
+	issueUUID, err := util.ParseUUID(info.IssueID)
+	if err != nil {
+		return
+	}
+	refs, err := n.queries.ListActiveLarkMessageRefsByIssue(ctx, issueUUID)
+	if err != nil {
+		n.log.Warn("lark: message ref lookup failed", "issue", info.IssueID, "err", err)
+		return
+	}
+	if len(refs) == 0 {
+		return
+	}
+	card := n.buildIssueTerminalCard(info)
+	for _, ref := range refs {
+		if ref.MessageID == "" {
+			continue
+		}
+		n.enqueue(ctx, larkJob{
+			card:           card,
+			event:          protocol.EventIssueUpdated,
+			wsID:           workspaceID,
+			issueID:        info.IssueID,
+			patchMessageID: ref.MessageID,
+			messageRefID:   ref.ID,
+		})
+	}
+}
+
+func (n *LarkNotify) buildIssueTerminalCard(info IssueInfo) map[string]any {
+	title := fmt.Sprintf("%s: %s", terminalStatusTitle(info.Status), info.Identifier)
+	elements := []map[string]any{
+		{"tag": "markdown", "content": "**" + info.Title + "**"},
+	}
+	if fields := issueFieldsMarkdown(info); fields != "" {
+		elements = append(elements, map[string]any{
+			"tag": "markdown", "content": fields,
+		})
+	}
+	return buildCardWithElements(title, elements, []cardButton{{Text: "View", URL: n.IssueURL(info)}})
 }
 
 // NotifyTaskCompleted emits a "task completed" card. P1 doesn't yet link to
@@ -385,7 +440,7 @@ func (n *LarkNotify) dispatch(ctx context.Context, workspaceID string, eventKind
 // hasn't linked their Lark account, falls back to team chat.
 // The build function receives the target channel so callers can select
 // the appropriate card template per destination.
-func (n *LarkNotify) dispatchRouted(ctx context.Context, workspaceID string, eventKind string, assigneeUserID string, cond LarkRoutingConditions, build func(LarkChannel) any) {
+func (n *LarkNotify) dispatchRouted(ctx context.Context, workspaceID string, eventKind string, assigneeUserID string, cond LarkRoutingConditions, build func(LarkChannel) larkRenderedCard) {
 	if !n.cfg.Configured() {
 		return
 	}
@@ -416,17 +471,44 @@ func (n *LarkNotify) dispatchRouted(ctx context.Context, workspaceID string, eve
 	}
 
 	for _, ch := range decision.Channels {
-		card := build(ch)
+		rendered := build(ch)
 		switch ch {
 		case LarkChannelTeam:
-			n.enqueue(ctx, larkJob{targetID: binding.ChatID, sendMode: larkSendChat, card: card, event: eventKind, wsID: workspaceID})
+			n.enqueue(ctx, larkJob{
+				targetID: binding.ChatID,
+				sendMode: larkSendChat,
+				card:     rendered.payload,
+				event:    eventKind,
+				wsID:     workspaceID,
+				issueID:  rendered.issueID,
+				channel:  LarkChannelTeam,
+				cardKind: rendered.kind,
+			})
 
 		case LarkChannelDM:
 			openID := n.resolveAssigneeLarkOpenID(ctx, assigneeUserID)
 			if openID == "" {
-				n.enqueue(ctx, larkJob{targetID: binding.ChatID, sendMode: larkSendChat, card: card, event: eventKind, wsID: workspaceID})
+				n.enqueue(ctx, larkJob{
+					targetID: binding.ChatID,
+					sendMode: larkSendChat,
+					card:     rendered.payload,
+					event:    eventKind,
+					wsID:     workspaceID,
+					issueID:  rendered.issueID,
+					channel:  LarkChannelTeam,
+					cardKind: rendered.kind,
+				})
 			} else {
-				n.enqueue(ctx, larkJob{targetID: openID, sendMode: larkSendDM, card: card, event: eventKind, wsID: workspaceID})
+				n.enqueue(ctx, larkJob{
+					targetID: openID,
+					sendMode: larkSendDM,
+					card:     rendered.payload,
+					event:    eventKind,
+					wsID:     workspaceID,
+					issueID:  rendered.issueID,
+					channel:  LarkChannelDM,
+					cardKind: rendered.kind,
+				})
 			}
 
 		case LarkChannelThreadReply:
@@ -474,22 +556,77 @@ func (n *LarkNotify) resolveLarkUserPref(ctx context.Context, userID string) Lar
 	return pref
 }
 
+func (n *LarkNotify) recordMessageRef(ctx context.Context, job larkJob, messageID string) {
+	if n.queries == nil || messageID == "" || job.issueID == "" || job.wsID == "" {
+		return
+	}
+	if job.cardKind == LarkCardNone || job.channel == "" || job.targetID == "" {
+		return
+	}
+	wsUUID, err := util.ParseUUID(job.wsID)
+	if err != nil {
+		return
+	}
+	issueUUID, err := util.ParseUUID(job.issueID)
+	if err != nil {
+		return
+	}
+	if _, err := n.queries.UpsertLarkMessageRef(ctx, db.UpsertLarkMessageRefParams{
+		WorkspaceID:  wsUUID,
+		IssueID:      issueUUID,
+		StageOrEvent: string(job.cardKind),
+		Channel:      string(job.channel),
+		TargetID:     job.targetID,
+		MessageID:    messageID,
+	}); err != nil {
+		n.log.Warn("lark: record message ref failed", "event", job.event, "ws", job.wsID, "issue", job.issueID, "err", err)
+	}
+}
+
+func (n *LarkNotify) finalizeMessageRef(ctx context.Context, job larkJob) {
+	if n.queries == nil || !job.messageRefID.Valid {
+		return
+	}
+	eventRef := "issue:" + job.issueID + ":" + job.event
+	if err := n.queries.FinalizeLarkMessageRef(ctx, db.FinalizeLarkMessageRefParams{
+		ID:           job.messageRefID,
+		LastEventRef: pgtype.Text{String: eventRef, Valid: eventRef != ""},
+	}); err != nil {
+		n.log.Warn("lark: finalize message ref failed", "event", job.event, "ws", job.wsID, "issue", job.issueID, "err", err)
+	}
+}
+
+func (n *LarkNotify) processJob(ctx context.Context, job larkJob) {
+	var err error
+	messageID := ""
+	if job.patchMessageID != "" {
+		err = n.client.PatchInteractiveCard(ctx, job.patchMessageID, job.card)
+		if err == nil {
+			n.finalizeMessageRef(ctx, job)
+		}
+	} else {
+		switch job.sendMode {
+		case larkSendDM:
+			messageID, err = n.client.SendInteractiveCardToUser(ctx, job.targetID, job.card)
+		default:
+			messageID, err = n.client.SendInteractiveCard(ctx, job.targetID, job.card)
+		}
+		if err == nil {
+			n.recordMessageRef(ctx, job, messageID)
+		}
+	}
+	if err != nil {
+		n.log.Warn("lark: job failed", "op", job.opName(), "event", job.event, "ws", job.wsID, "mode", job.sendMode, "err", err)
+	}
+}
+
 // enqueue puts a job onto the worker channel. When workers haven't started
 // (tests, unconfigured) it sends inline. When the queue is full it drops.
 func (n *LarkNotify) enqueue(ctx context.Context, job larkJob) {
 	if !n.started.Load() {
 		sendCtx, cancel := context.WithTimeout(ctx, n.sendTimeout)
 		defer cancel()
-		var err error
-		switch job.sendMode {
-		case larkSendDM:
-			err = n.client.SendInteractiveCardToUser(sendCtx, job.targetID, job.card)
-		default:
-			err = n.client.SendInteractiveCard(sendCtx, job.targetID, job.card)
-		}
-		if err != nil {
-			n.log.Warn("lark: send failed", "event", job.event, "ws", job.wsID, "mode", job.sendMode, "err", err)
-		}
+		n.processJob(sendCtx, job)
 		return
 	}
 	select {
@@ -497,6 +634,13 @@ func (n *LarkNotify) enqueue(ctx context.Context, job larkJob) {
 	default:
 		n.log.Warn("lark: queue full, dropping event", "event", job.event, "ws", job.wsID)
 	}
+}
+
+func (j larkJob) opName() string {
+	if j.patchMessageID != "" {
+		return "patch"
+	}
+	return "send"
 }
 
 // ResolveWorkspaceSlug is exposed so listener code can fill IssueInfo
@@ -607,7 +751,10 @@ func buildCardWithElements(headerTitle string, elements []map[string]any, button
 		})
 	}
 	return map[string]any{
-		"config": map[string]any{"wide_screen_mode": true},
+		"config": map[string]any{
+			"wide_screen_mode": true,
+			"update_multi":     true,
+		},
 		"header": map[string]any{
 			"title": map[string]any{"tag": "plain_text", "content": headerTitle},
 		},
@@ -664,6 +811,19 @@ func priorityLabel(p string) string {
 		return "🔵 Low"
 	default:
 		return p
+	}
+}
+
+func IsTerminalIssueStatus(status string) bool {
+	return status == "done" || status == "cancelled"
+}
+
+func terminalStatusTitle(status string) string {
+	switch status {
+	case "cancelled":
+		return "🚫 Cancelled"
+	default:
+		return "✅ Done"
 	}
 }
 

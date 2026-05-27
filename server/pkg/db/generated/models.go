@@ -414,6 +414,22 @@ type LarkIssueLink struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
+type LarkMessageRef struct {
+	ID           pgtype.UUID        `json:"id"`
+	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
+	IssueID      pgtype.UUID        `json:"issue_id"`
+	StageOrEvent string             `json:"stage_or_event"`
+	Channel      string             `json:"channel"`
+	TargetID     string             `json:"target_id"`
+	MessageID    string             `json:"message_id"`
+	Version      int32              `json:"version"`
+	LastEventRef pgtype.Text        `json:"last_event_ref"`
+	Status       string             `json:"status"`
+	SupersededAt pgtype.Timestamptz `json:"superseded_at"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
 type LarkUserLink struct {
 	UserID          pgtype.UUID        `json:"user_id"`
 	LarkOpenID      string             `json:"lark_open_id"`

@@ -38,6 +38,26 @@ func (q *Queries) DeleteLarkWorkspaceBinding(ctx context.Context, workspaceID pg
 	return err
 }
 
+const finalizeLarkMessageRef = `-- name: FinalizeLarkMessageRef :exec
+UPDATE lark_message_ref
+SET status = 'finalized',
+    version = version + 1,
+    last_event_ref = $2,
+    updated_at = now()
+WHERE id = $1
+  AND status = 'active'
+`
+
+type FinalizeLarkMessageRefParams struct {
+	ID           pgtype.UUID `json:"id"`
+	LastEventRef pgtype.Text `json:"last_event_ref"`
+}
+
+func (q *Queries) FinalizeLarkMessageRef(ctx context.Context, arg FinalizeLarkMessageRefParams) error {
+	_, err := q.db.Exec(ctx, finalizeLarkMessageRef, arg.ID, arg.LastEventRef)
+	return err
+}
+
 const getLarkIssueLinkByIssueID = `-- name: GetLarkIssueLinkByIssueID :one
 SELECT issue_id, chat_id, root_message_id, created_at FROM lark_issue_link
 WHERE issue_id = $1
@@ -201,6 +221,47 @@ func (q *Queries) InsertLarkIssueLink(ctx context.Context, arg InsertLarkIssueLi
 	return i, err
 }
 
+const listActiveLarkMessageRefsByIssue = `-- name: ListActiveLarkMessageRefsByIssue :many
+SELECT id, workspace_id, issue_id, stage_or_event, channel, target_id, message_id, version, last_event_ref, status, superseded_at, created_at, updated_at FROM lark_message_ref
+WHERE issue_id = $1
+  AND status = 'active'
+ORDER BY created_at ASC
+`
+
+func (q *Queries) ListActiveLarkMessageRefsByIssue(ctx context.Context, issueID pgtype.UUID) ([]LarkMessageRef, error) {
+	rows, err := q.db.Query(ctx, listActiveLarkMessageRefsByIssue, issueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LarkMessageRef{}
+	for rows.Next() {
+		var i LarkMessageRef
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.IssueID,
+			&i.StageOrEvent,
+			&i.Channel,
+			&i.TargetID,
+			&i.MessageID,
+			&i.Version,
+			&i.LastEventRef,
+			&i.Status,
+			&i.SupersededAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLarkWorkspaceBindings = `-- name: ListLarkWorkspaceBindings :many
 SELECT workspace_id, chat_id, bot_token_enc, enabled_events, created_at, updated_at, last_perm_warning_at FROM lark_workspace_binding
 ORDER BY created_at ASC
@@ -298,6 +359,64 @@ func (q *Queries) UpdateLarkWorkspaceBindingEvents(ctx context.Context, arg Upda
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastPermWarningAt,
+	)
+	return i, err
+}
+
+const upsertLarkMessageRef = `-- name: UpsertLarkMessageRef :one
+
+INSERT INTO lark_message_ref (
+    workspace_id, issue_id, stage_or_event, channel, target_id, message_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+ON CONFLICT (issue_id, stage_or_event, channel, target_id)
+WHERE status = 'active'
+DO UPDATE SET
+    workspace_id   = EXCLUDED.workspace_id,
+    message_id     = EXCLUDED.message_id,
+    version        = lark_message_ref.version + 1,
+    last_event_ref = NULL,
+    updated_at     = now()
+RETURNING id, workspace_id, issue_id, stage_or_event, channel, target_id, message_id, version, last_event_ref, status, superseded_at, created_at, updated_at
+`
+
+type UpsertLarkMessageRefParams struct {
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+	IssueID      pgtype.UUID `json:"issue_id"`
+	StageOrEvent string      `json:"stage_or_event"`
+	Channel      string      `json:"channel"`
+	TargetID     string      `json:"target_id"`
+	MessageID    string      `json:"message_id"`
+}
+
+// =====================
+// Lark message refs
+// =====================
+func (q *Queries) UpsertLarkMessageRef(ctx context.Context, arg UpsertLarkMessageRefParams) (LarkMessageRef, error) {
+	row := q.db.QueryRow(ctx, upsertLarkMessageRef,
+		arg.WorkspaceID,
+		arg.IssueID,
+		arg.StageOrEvent,
+		arg.Channel,
+		arg.TargetID,
+		arg.MessageID,
+	)
+	var i LarkMessageRef
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.StageOrEvent,
+		&i.Channel,
+		&i.TargetID,
+		&i.MessageID,
+		&i.Version,
+		&i.LastEventRef,
+		&i.Status,
+		&i.SupersededAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }

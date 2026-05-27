@@ -107,3 +107,38 @@ WHERE root_message_id = $1;
 
 -- name: DeleteLarkIssueLink :exec
 DELETE FROM lark_issue_link WHERE issue_id = $1;
+
+-- =====================
+-- Lark message refs
+-- =====================
+
+-- name: UpsertLarkMessageRef :one
+INSERT INTO lark_message_ref (
+    workspace_id, issue_id, stage_or_event, channel, target_id, message_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+ON CONFLICT (issue_id, stage_or_event, channel, target_id)
+WHERE status = 'active'
+DO UPDATE SET
+    workspace_id   = EXCLUDED.workspace_id,
+    message_id     = EXCLUDED.message_id,
+    version        = lark_message_ref.version + 1,
+    last_event_ref = NULL,
+    updated_at     = now()
+RETURNING *;
+
+-- name: ListActiveLarkMessageRefsByIssue :many
+SELECT * FROM lark_message_ref
+WHERE issue_id = $1
+  AND status = 'active'
+ORDER BY created_at ASC;
+
+-- name: FinalizeLarkMessageRef :exec
+UPDATE lark_message_ref
+SET status = 'finalized',
+    version = version + 1,
+    last_event_ref = $2,
+    updated_at = now()
+WHERE id = $1
+  AND status = 'active';

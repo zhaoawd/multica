@@ -187,34 +187,91 @@ func (c *LarkClient) tenantAccessToken(ctx context.Context) (string, error) {
 
 // SendInteractiveCard posts an interactive card to a chat by chat_id.
 // The card argument is the JSON-serialisable card structure per Lark's
-// "message-card" spec. Returns an error if the API call fails.
-func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, card any) error {
+// "message-card" spec. Returns Lark's open_message_id when the API
+// includes it in the response.
+func (c *LarkClient) SendInteractiveCard(ctx context.Context, chatID string, card any) (string, error) {
 	if chatID == "" {
-		return errors.New("chat_id required")
+		return "", errors.New("chat_id required")
 	}
 	return c.sendCard(ctx, "chat_id", chatID, card)
 }
 
 // SendInteractiveCardToUser posts an interactive card to a user's DM by open_id.
-func (c *LarkClient) SendInteractiveCardToUser(ctx context.Context, openID string, card any) error {
+func (c *LarkClient) SendInteractiveCardToUser(ctx context.Context, openID string, card any) (string, error) {
 	if openID == "" {
-		return errors.New("open_id required")
+		return "", errors.New("open_id required")
 	}
 	return c.sendCard(ctx, "open_id", openID, card)
 }
 
-func (c *LarkClient) sendCard(ctx context.Context, receiveIDType, receiveID string, card any) error {
+func (c *LarkClient) sendCard(ctx context.Context, receiveIDType, receiveID string, card any) (string, error) {
+	if !c.cfg.Configured() {
+		return "", errors.New("lark not configured")
+	}
+	cardBytes, err := json.Marshal(card)
+	if err != nil {
+		return "", err
+	}
+	payload := map[string]string{
+		"receive_id": receiveID,
+		"msg_type":   "interactive",
+		"content":    string(cardBytes),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	token, err := c.tenantAccessToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	endpoint := c.apiBase + "/im/v1/messages?receive_id_type=" + receiveIDType
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("lark send: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if out.Code != 0 {
+		return "", fmt.Errorf("lark send: code=%d msg=%s", out.Code, out.Msg)
+	}
+	return out.Data.MessageID, nil
+}
+
+// PatchInteractiveCard updates a previously-sent interactive card by
+// open_message_id. Lark requires the original and replacement cards to be
+// shared cards (`config.update_multi=true`), which our card builders set for
+// cards that can enter this path.
+func (c *LarkClient) PatchInteractiveCard(ctx context.Context, messageID string, card any) error {
 	if !c.cfg.Configured() {
 		return errors.New("lark not configured")
+	}
+	if messageID == "" {
+		return errors.New("message_id required")
 	}
 	cardBytes, err := json.Marshal(card)
 	if err != nil {
 		return err
 	}
 	payload := map[string]string{
-		"receive_id": receiveID,
-		"msg_type":   "interactive",
-		"content":    string(cardBytes),
+		"msg_type": "interactive",
+		"content":  string(cardBytes),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -224,8 +281,8 @@ func (c *LarkClient) sendCard(ctx context.Context, receiveIDType, receiveID stri
 	if err != nil {
 		return err
 	}
-	endpoint := c.apiBase + "/im/v1/messages?receive_id_type=" + receiveIDType
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	endpoint := c.apiBase + "/im/v1/messages/" + url.PathEscape(messageID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -242,10 +299,10 @@ func (c *LarkClient) sendCard(ctx context.Context, receiveIDType, receiveID stri
 		Msg  string `json:"msg"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return fmt.Errorf("lark send: bad response (%d): %s", resp.StatusCode, string(raw))
+		return fmt.Errorf("lark patch card: bad response (%d): %s", resp.StatusCode, string(raw))
 	}
 	if out.Code != 0 {
-		return fmt.Errorf("lark send: code=%d msg=%s", out.Code, out.Msg)
+		return fmt.Errorf("lark patch card: code=%d msg=%s", out.Code, out.Msg)
 	}
 	return nil
 }

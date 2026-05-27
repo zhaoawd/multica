@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -87,6 +89,7 @@ func TestBuildCard_ShapeStaysStable(t *testing.T) {
 	for _, needle := range []string{
 		`"config"`,
 		`"wide_screen_mode":true`,
+		`"update_multi":true`,
 		`"header"`,
 		`"plain_text"`,
 		`"Header"`,
@@ -99,6 +102,107 @@ func TestBuildCard_ShapeStaysStable(t *testing.T) {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("card JSON missing %q: %s", needle, js)
 		}
+	}
+}
+
+func TestLarkClient_SendInteractiveCard_ReturnsMessageID(t *testing.T) {
+	var gotPath string
+	var gotReceiveIDType string
+	var gotPayload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tenant_access_token") {
+			writeJSONResp(w, map[string]any{"code": 0, "tenant_access_token": "tk", "expire": 7200})
+			return
+		}
+		gotPath = r.URL.Path
+		gotReceiveIDType = r.URL.Query().Get("receive_id_type")
+		_ = json.NewDecoder(r.Body).Decode(&gotPayload)
+		writeJSONResp(w, map[string]any{
+			"code": 0,
+			"data": map[string]any{"message_id": "om_card"},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewLarkClient(fullCfg())
+	SetAPIBaseForTest(c, srv.URL)
+
+	messageID, err := c.SendInteractiveCard(context.Background(), "oc_chat", buildCard("Header", "Body", nil))
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if messageID != "om_card" {
+		t.Fatalf("messageID = %q, want om_card", messageID)
+	}
+	if !strings.HasSuffix(gotPath, "/im/v1/messages") {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotReceiveIDType != "chat_id" {
+		t.Fatalf("receive_id_type = %q, want chat_id", gotReceiveIDType)
+	}
+	if gotPayload["msg_type"] != "interactive" || gotPayload["receive_id"] != "oc_chat" {
+		t.Fatalf("payload = %#v", gotPayload)
+	}
+	if content, _ := gotPayload["content"].(string); !strings.Contains(content, `"update_multi":true`) {
+		t.Fatalf("content missing update_multi: %s", content)
+	}
+}
+
+func TestLarkClient_PatchInteractiveCard_PostsExpectedShape(t *testing.T) {
+	var gotMethod string
+	var gotPath string
+	var gotPayload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tenant_access_token") {
+			writeJSONResp(w, map[string]any{"code": 0, "tenant_access_token": "tk", "expire": 7200})
+			return
+		}
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotPayload)
+		writeJSONResp(w, map[string]any{"code": 0})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewLarkClient(fullCfg())
+	SetAPIBaseForTest(c, srv.URL)
+
+	if err := c.PatchInteractiveCard(context.Background(), "om_abc", buildCard("Done", "Body", nil)); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if gotMethod != http.MethodPatch {
+		t.Fatalf("method = %s, want PATCH", gotMethod)
+	}
+	if !strings.HasSuffix(gotPath, "/im/v1/messages/om_abc") {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotPayload["msg_type"] != "interactive" {
+		t.Fatalf("msg_type = %v, want interactive", gotPayload["msg_type"])
+	}
+	if content, _ := gotPayload["content"].(string); !strings.Contains(content, `"update_multi":true`) {
+		t.Fatalf("content missing update_multi: %s", content)
+	}
+}
+
+func TestBuildIssueTerminalCard_RemovesWriteActions(t *testing.T) {
+	n := newTestLarkNotify(fullCfg())
+	card := n.buildIssueTerminalCard(IssueInfo{
+		IssueID:       "uuid-1",
+		WorkspaceSlug: "team",
+		Identifier:    "MUL-42",
+		Title:         "Fix bug",
+		Status:        "done",
+		Priority:      "high",
+	})
+	js := CardJSON(card)
+	if !strings.Contains(js, `Done: MUL-42`) {
+		t.Fatalf("terminal header missing: %s", js)
+	}
+	if strings.Contains(js, `"value"`) {
+		t.Fatalf("terminal card should not include write-action values: %s", js)
+	}
+	if !strings.Contains(js, `"View"`) || !strings.Contains(js, `/team/issues/MUL-42`) {
+		t.Fatalf("terminal card should keep View link: %s", js)
 	}
 }
 

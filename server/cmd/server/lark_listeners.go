@@ -66,28 +66,33 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 		notify.NotifyIssueCreated(ctx, issue.WorkspaceID, info, hasAssignee, assigneeUserID, hasLarkIssueLink, assigneeIsWorkspaceAgent, creator)
 	})
 
-	// issue:updated → "assigned" card on assignee change.
-	// Other fields (priority, status, etc.) are intentionally not surfaced
-	// in P1 to keep the bound chat from becoming noisy. P5+ can layer in
-	// per-event toggles when the team validates which signals matter.
+	// issue:updated → "assigned" card on assignee change, and in-place
+	// patch of active cards when the issue reaches a terminal status.
+	// Non-terminal priority/status edits remain silent so the bound chat
+	// does not become a noisy field-change feed.
 	bus.Subscribe(protocol.EventIssueUpdated, func(e events.Event) {
 		payload, ok := e.Payload.(map[string]any)
 		if !ok {
 			return
 		}
 		assigneeChanged, _ := payload["assignee_changed"].(bool)
-		if !assigneeChanged {
-			return
-		}
+		statusChanged, _ := payload["status_changed"].(bool)
 		issue, ok := extractIssueFields(payload["issue"])
 		if !ok {
+			return
+		}
+		ctx := context.Background()
+		info := larkIssueInfo(ctx, notify, queries, issue)
+		if statusChanged && service.IsTerminalIssueStatus(issue.Status) {
+			notify.PatchIssueTerminalCards(ctx, issue.WorkspaceID, info)
+			return
+		}
+		if !assigneeChanged {
 			return
 		}
 		if issue.AssigneeID == nil || *issue.AssigneeID == "" {
 			return // unassignment — no card
 		}
-		ctx := context.Background()
-		info := larkIssueInfo(ctx, notify, queries, issue)
 		assigneeType := ""
 		if issue.AssigneeType != nil {
 			assigneeType = *issue.AssigneeType
