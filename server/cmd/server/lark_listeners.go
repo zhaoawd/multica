@@ -48,12 +48,20 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 		info := larkIssueInfo(ctx, notify, queries, issue)
 		hasAssignee := issue.AssigneeID != nil && *issue.AssigneeID != ""
 		assigneeUserID := ""
+		assigneeIsWorkspaceAgent := false
 		if hasAssignee {
 			assigneeUserID = *issue.AssigneeID
+			assigneeType := ""
+			if issue.AssigneeType != nil {
+				assigneeType = *issue.AssigneeType
+			}
+			if assigneeType == "agent" {
+				assigneeUserID, assigneeIsWorkspaceAgent = larkResolveAgentOwner(ctx, queries, *issue.AssigneeID)
+			}
 		}
 		hasLarkIssueLink := larkHasIssueLink(ctx, queries, info.IssueID)
 		creator := larkActorName(ctx, queries, issue.CreatorType, issue.CreatorID)
-		notify.NotifyIssueCreated(ctx, issue.WorkspaceID, info, hasAssignee, assigneeUserID, hasLarkIssueLink, creator)
+		notify.NotifyIssueCreated(ctx, issue.WorkspaceID, info, hasAssignee, assigneeUserID, hasLarkIssueLink, assigneeIsWorkspaceAgent, creator)
 	})
 
 	// issue:updated → "assigned" card on assignee change.
@@ -82,8 +90,13 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 		if issue.AssigneeType != nil {
 			assigneeType = *issue.AssigneeType
 		}
+		assigneeUserID := *issue.AssigneeID
+		assigneeIsWorkspaceAgent := false
+		if assigneeType == "agent" {
+			assigneeUserID, assigneeIsWorkspaceAgent = larkResolveAgentOwner(ctx, queries, *issue.AssigneeID)
+		}
 		name := larkActorName(ctx, queries, assigneeType, *issue.AssigneeID)
-		notify.NotifyIssueAssigned(ctx, issue.WorkspaceID, info, name, *issue.AssigneeID)
+		notify.NotifyIssueAssigned(ctx, issue.WorkspaceID, info, name, assigneeUserID, assigneeIsWorkspaceAgent)
 	})
 
 	// task:completed and task:failed share the same payload shape (see
@@ -341,6 +354,31 @@ func larkActorName(ctx context.Context, queries *db.Queries, actorType, actorID 
 		return agent.Name
 	}
 	return ""
+}
+
+// larkResolveAgentOwner looks up an agent and returns the DM target
+// user ID and whether the agent is a workspace-level (cloud) agent.
+//
+// Local (daemon) agents have an owner — the person running the daemon.
+// The returned userID is the owner's user UUID so the DM goes to them.
+// Workspace (cloud) agents have no personal owner; the returned userID
+// is empty and isWorkspaceAgent is true, which routes to team chat.
+func larkResolveAgentOwner(ctx context.Context, queries *db.Queries, agentID string) (userID string, isWorkspaceAgent bool) {
+	id, err := util.ParseUUID(agentID)
+	if err != nil {
+		return "", false
+	}
+	agent, err := queries.GetAgent(ctx, id)
+	if err != nil {
+		return "", false
+	}
+	if agent.RuntimeMode == "cloud" {
+		return "", true
+	}
+	if agent.OwnerID.Valid {
+		return util.UUIDToString(agent.OwnerID), false
+	}
+	return "", false
 }
 
 // larkHasIssueLink checks whether an issue has a lark_issue_link row

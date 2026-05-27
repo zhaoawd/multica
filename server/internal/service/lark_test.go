@@ -149,7 +149,7 @@ func TestBuildCard_NoButtonsOmitsActionElement(t *testing.T) {
 	}
 }
 
-func TestWebSocketModeSuppressesActionButtons(t *testing.T) {
+func TestActionButtonsPresentInBothModes(t *testing.T) {
 	info := IssueInfo{
 		IssueID:       "uuid-1",
 		WorkspaceSlug: "team",
@@ -180,41 +180,32 @@ func TestWebSocketModeSuppressesActionButtons(t *testing.T) {
 		return false
 	}
 
-	t.Run("webhook mode includes Claim button", func(t *testing.T) {
-		n := newTestLarkNotify(fullCfg())
-		card := n.buildIssueCreatedCard(info, false, "alice")
-		if !cardHasValueButton(card) {
-			t.Fatal("webhook mode should include Claim action button")
+	for _, mode := range []string{"", "websocket"} {
+		label := "webhook"
+		if mode == "websocket" {
+			label = "websocket"
 		}
-	})
 
-	t.Run("websocket mode suppresses Claim button", func(t *testing.T) {
-		cfg := fullCfg()
-		cfg.CallbackMode = "websocket"
-		n := newTestLarkNotify(cfg)
-		card := n.buildIssueCreatedCard(info, false, "alice")
-		if cardHasValueButton(card) {
-			t.Fatal("websocket mode should suppress Claim action button")
-		}
-	})
+		t.Run(label+" mode includes Claim button", func(t *testing.T) {
+			cfg := fullCfg()
+			cfg.CallbackMode = mode
+			n := newTestLarkNotify(cfg)
+			card := n.buildIssueCreatedCard(info, false, "alice")
+			if !cardHasValueButton(card) {
+				t.Fatalf("%s mode should include Claim action button", label)
+			}
+		})
 
-	t.Run("webhook mode includes Mark Done button", func(t *testing.T) {
-		n := newTestLarkNotify(fullCfg())
-		card := n.buildIssueAssignedCard(info, "bob")
-		if !cardHasValueButton(card) {
-			t.Fatal("webhook mode should include Mark Done action button")
-		}
-	})
-
-	t.Run("websocket mode suppresses Mark Done button", func(t *testing.T) {
-		cfg := fullCfg()
-		cfg.CallbackMode = "websocket"
-		n := newTestLarkNotify(cfg)
-		card := n.buildIssueAssignedCard(info, "bob")
-		if cardHasValueButton(card) {
-			t.Fatal("websocket mode should suppress Mark Done action button")
-		}
-	})
+		t.Run(label+" mode includes Mark Done button", func(t *testing.T) {
+			cfg := fullCfg()
+			cfg.CallbackMode = mode
+			n := newTestLarkNotify(cfg)
+			card := n.buildIssueAssignedCard(info, "bob")
+			if !cardHasValueButton(card) {
+				t.Fatalf("%s mode should include Mark Done action button", label)
+			}
+		})
+	}
 }
 
 func TestSliceContains(t *testing.T) {

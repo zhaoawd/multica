@@ -170,6 +170,14 @@ type LarkRoutingConditions struct {
 	// who have not yet linked their account.
 	UserPref LarkUserPref `yaml:"user_pref"`
 
+	// AssigneeIsWorkspaceAgent is true when the assignee is a workspace-
+	// level (cloud) agent rather than a member or a local (daemon) agent.
+	// Workspace agents have no personal owner to DM — the assignment is
+	// a team-visible signal, so it routes to team chat instead of DM.
+	// Local agents route to the owner's DM (the listener resolves the
+	// owner's user ID as the assigneeUserID).
+	AssigneeIsWorkspaceAgent bool `yaml:"assignee_is_workspace_agent"`
+
 	// HasActiveLarkMessageRef applies to streaming patch events
 	// (task:dispatch, task:progress). True when lark_message_ref
 	// already holds a card for this task / issue stream — i.e. an
@@ -234,7 +242,16 @@ func RouteLarkEvent(c LarkRoutingConditions) LarkRoutingDecision {
 			card = LarkCardCreatedConfirmation
 		}
 		if c.HasAssignee {
-			channels = append(channels, LarkChannelDM)
+			if c.AssigneeIsWorkspaceAgent {
+				// Workspace (cloud) agents have no personal owner —
+				// the assignment is a team-visible signal.
+				channels = append(channels, LarkChannelTeam)
+			} else {
+				// Members and local (daemon) agents get a personal DM.
+				// For local agents the listener resolves the owner's
+				// user ID as the DM target.
+				channels = append(channels, LarkChannelDM)
+			}
 			// If both apply, the thread confirmation card takes the
 			// labelled slot — the DM card kind is implied by the
 			// presence of dm in Channels and the listener picks the
@@ -255,7 +272,11 @@ func RouteLarkEvent(c LarkRoutingConditions) LarkRoutingDecision {
 		// else is silent. assignee_changed without a new assignee is
 		// an unassignment — also silent (no one to DM).
 		if c.AssigneeChanged && c.HasAssignee {
-			channels = append(channels, LarkChannelDM)
+			if c.AssigneeIsWorkspaceAgent {
+				channels = append(channels, LarkChannelTeam)
+			} else {
+				channels = append(channels, LarkChannelDM)
+			}
 			card = LarkCardAssigned
 		}
 

@@ -211,11 +211,12 @@ func (n *LarkNotify) IssueURL(info IssueInfo) string {
 // issues go to the team chat (claim card); assigned issues go to the
 // assignee's DM (falls back to team chat if the user hasn't linked Lark).
 // Thread-linked issues route to thread_reply (handled by LarkThreadService).
-func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, assigneeUserID string, hasLarkIssueLink bool, creatorName string) {
+func (n *LarkNotify) NotifyIssueCreated(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, assigneeUserID string, hasLarkIssueLink bool, assigneeIsWorkspaceAgent bool, creatorName string) {
 	cond := LarkRoutingConditions{
-		Event:            protocol.EventIssueCreated,
-		HasAssignee:      hasAssignee,
-		HasLarkIssueLink: hasLarkIssueLink,
+		Event:                   protocol.EventIssueCreated,
+		HasAssignee:             hasAssignee,
+		HasLarkIssueLink:        hasLarkIssueLink,
+		AssigneeIsWorkspaceAgent: assigneeIsWorkspaceAgent,
 	}
 	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueCreated, assigneeUserID, cond, func(ch LarkChannel) any {
 		if ch == LarkChannelDM && hasAssignee {
@@ -232,7 +233,7 @@ func (n *LarkNotify) buildIssueCreatedCard(info IssueInfo, hasAssignee bool, cre
 		desc = fmt.Sprintf("%s\n\n_Created by %s_", desc, creatorName)
 	}
 	buttons := []cardButton{}
-	if !hasAssignee && info.IssueID != "" && !n.cfg.IsWebSocket() {
+	if !hasAssignee && info.IssueID != "" {
 		buttons = append(buttons, cardButton{
 			Text:  "Claim",
 			Type:  "primary",
@@ -246,11 +247,12 @@ func (n *LarkNotify) buildIssueCreatedCard(info IssueInfo, hasAssignee bool, cre
 // NotifyIssueAssigned emits an "issue assigned" card on assignee change.
 // Routing: always goes to the assignee's DM (falls back to team chat if
 // the user hasn't linked Lark).
-func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string, info IssueInfo, assigneeName string, assigneeUserID string) {
+func (n *LarkNotify) NotifyIssueAssigned(ctx context.Context, workspaceID string, info IssueInfo, assigneeName string, assigneeUserID string, assigneeIsWorkspaceAgent bool) {
 	cond := LarkRoutingConditions{
-		Event:           protocol.EventIssueUpdated,
-		HasAssignee:     true,
-		AssigneeChanged: true,
+		Event:                    protocol.EventIssueUpdated,
+		HasAssignee:              true,
+		AssigneeChanged:          true,
+		AssigneeIsWorkspaceAgent: assigneeIsWorkspaceAgent,
 	}
 	n.dispatchRouted(ctx, workspaceID, protocol.EventIssueUpdated, assigneeUserID, cond, func(_ LarkChannel) any {
 		return n.buildIssueAssignedCard(info, assigneeName)
@@ -264,7 +266,7 @@ func (n *LarkNotify) buildIssueAssignedCard(info IssueInfo, assigneeName string)
 		desc = fmt.Sprintf("%s\n\n_Assignee: %s_", desc, assigneeName)
 	}
 	buttons := []cardButton{}
-	if info.IssueID != "" && !n.cfg.IsWebSocket() {
+	if info.IssueID != "" {
 		buttons = append(buttons, cardButton{
 			Text:  "Mark Done",
 			Type:  "primary",

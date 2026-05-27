@@ -177,12 +177,17 @@ func (h *Handler) larkSlashStatusText(ctx context.Context, msg larkInboundMessag
 	}
 
 	if len(binding.EnabledEvents) == 0 {
-		b.WriteString("• Enabled events: (none)")
+		b.WriteString("• Enabled events: (none)\n")
 	} else {
 		b.WriteString("• Enabled events: ")
 		b.WriteString(strings.Join(binding.EnabledEvents, ", "))
+		b.WriteString("\n")
 	}
-	return b.String()
+
+	if strings.EqualFold(h.LarkCallbackMode, "websocket") {
+		b.WriteString("• Callback: websocket (card actions require HTTP callback URL in Lark developer console)")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // handleLarkSlashWhoami implements the §14.1.2 privacy contract for

@@ -268,8 +268,13 @@ func (h *Handler) processLarkCardAction(ctx context.Context, openID string, valu
 }
 
 // larkClaimIssueCore assigns the issue to the clicking user and returns
-// a toast. Transport-agnostic.
+// a toast. Transport-agnostic. Rejects the claim if the issue already
+// has an assignee — stale Claim cards from before someone else claimed
+// the issue must not silently reassign.
 func (h *Handler) larkClaimIssueCore(ctx context.Context, issue db.Issue, userID pgtype.UUID) larkToast {
+	if issue.AssigneeID.Valid {
+		return toastResponse("info", "Already claimed by someone else")
+	}
 	updated, err := h.Queries.UpdateIssue(ctx, db.UpdateIssueParams{
 		ID:            issue.ID,
 		AssigneeType:  pgtype.Text{String: "member", Valid: true},

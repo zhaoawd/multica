@@ -24,6 +24,7 @@
 #   assignee_changed:     applies to issue:updated only
 #   comment_type:         applies to comment:created only
 #   has_mention:          comment text references a member/agent/squad/@all
+#   assignee_is_workspace_agent: assignee is a workspace (cloud) agent, not a member or local agent
 #   user_pref:            LarkUserPref snapshot (see lark_routing.go)
 
 cases:
@@ -49,6 +50,7 @@ cases:
       must_not_channels: [team, dm]
 
   - name: issue_created_with_assignee_no_thread
+    # Assignee is a member or local agent — DM to person.
     conditions:
       event: issue:created
       has_assignee: true
@@ -57,6 +59,19 @@ cases:
       channels: [dm]
       card: assigned_card
       must_not_channels: [team, thread_reply]
+
+  - name: issue_created_with_workspace_agent_no_thread
+    # Workspace (cloud) agent assignee — no personal owner to DM,
+    # route to team chat instead.
+    conditions:
+      event: issue:created
+      has_assignee: true
+      has_lark_issue_link: false
+      assignee_is_workspace_agent: true
+    expected:
+      channels: [team]
+      card: assigned_card
+      must_not_channels: [dm, thread_reply]
 
   - name: issue_created_with_assignee_with_thread
     # Both anchors apply: thread gets the creation confirmation,
@@ -70,8 +85,22 @@ cases:
       card: created_confirmation
       must_not_channels: [team]
 
+  - name: issue_created_with_workspace_agent_with_thread
+    # Workspace agent + thread: thread gets confirmation, team gets
+    # the assigned card (no DM for workspace agents).
+    conditions:
+      event: issue:created
+      has_assignee: true
+      has_lark_issue_link: true
+      assignee_is_workspace_agent: true
+    expected:
+      channels: [team, thread_reply]
+      card: created_confirmation
+      must_not_channels: [dm]
+
   # ── issue:updated ────────────────────────────────────────────────
   - name: issue_updated_assignee_changed
+    # Member or local agent assignee — DM to person.
     conditions:
       event: issue:updated
       assignee_changed: true
@@ -80,6 +109,18 @@ cases:
       channels: [dm]
       card: assigned_card
       must_not_channels: [team, thread_reply]
+
+  - name: issue_updated_assignee_changed_workspace_agent
+    # Workspace (cloud) agent — team chat, not DM.
+    conditions:
+      event: issue:updated
+      assignee_changed: true
+      has_assignee: true
+      assignee_is_workspace_agent: true
+    expected:
+      channels: [team]
+      card: assigned_card
+      must_not_channels: [dm, thread_reply]
 
   - name: issue_updated_assignee_changed_to_unassigned
     # Unassignment (assignee_changed=true, has_assignee=false) is
