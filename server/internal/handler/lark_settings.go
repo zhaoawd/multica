@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -209,7 +211,38 @@ func filterSupportedEvents(in []string) []string {
 
 // ── Per-user Lark notification preferences ────────────────────────────
 
+// larkActivePrefs is the whitelist of pref keys currently wired into
+// the routing function. task_completed_dm, task_failed_dm, and
+// mention_dm exist on LarkUserPref (and the routing golden tests
+// exercise them) but NotifyTaskCompleted / NotifyTaskFailed /
+// NotifyComment still use dispatch() → team chat. Exposing toggles
+// for them would mislead users into thinking they work. Add keys
+// here as the corresponding Notify methods migrate to dispatchRouted.
+var larkActivePrefs = []string{"assigned_dm", "agent_clarification_dm"}
+
+func loadLarkUserPref(ctx context.Context, q *db.Queries, userUUID pgtype.UUID) service.LarkUserPref {
+	raw, err := q.GetLarkUserPrefs(ctx, userUUID)
+	if err != nil || len(raw) == 0 {
+		return service.DefaultLarkUserPref()
+	}
+	pref := service.DefaultLarkUserPref()
+	json.Unmarshal(raw, &pref)
+	return pref
+}
+
+func larkPrefToActiveMap(p service.LarkUserPref) map[string]bool {
+	full, _ := json.Marshal(p)
+	var all map[string]bool
+	json.Unmarshal(full, &all)
+	out := make(map[string]bool, len(larkActivePrefs))
+	for _, k := range larkActivePrefs {
+		out[k] = all[k]
+	}
+	return out
+}
+
 // GetMyLarkPrefs returns the calling user's Lark DM preferences.
+// Only actively-wired prefs are surfaced.
 func (h *Handler) GetMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
 	userID := requestUserID(r)
 	if userID == "" {
@@ -220,23 +253,13 @@ func (h *Handler) GetMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	raw, err := h.Queries.GetLarkUserPrefs(r.Context(), userUUID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			writeJSON(w, http.StatusOK, service.DefaultLarkUserPref())
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to load prefs")
-		return
-	}
-	pref := service.DefaultLarkUserPref()
-	if len(raw) > 0 {
-		json.Unmarshal(raw, &pref)
-	}
-	writeJSON(w, http.StatusOK, pref)
+	pref := loadLarkUserPref(r.Context(), h.Queries, userUUID)
+	writeJSON(w, http.StatusOK, larkPrefToActiveMap(pref))
 }
 
-// PatchMyLarkPrefs updates the calling user's Lark DM preferences.
+// PatchMyLarkPrefs merges submitted fields into the user's existing
+// preferences. Unsubmitted keys are left unchanged. Only actively-
+// wired pref keys are accepted; unknown keys are silently ignored.
 func (h *Handler) PatchMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
 	userID := requestUserID(r)
 	if userID == "" {
@@ -247,12 +270,24 @@ func (h *Handler) PatchMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var incoming service.LarkUserPref
+	var incoming map[string]bool
 	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	prefsJSON, err := json.Marshal(incoming)
+
+	pref := loadLarkUserPref(r.Context(), h.Queries, userUUID)
+	for _, k := range larkActivePrefs {
+		if v, present := incoming[k]; present {
+			switch k {
+			case "assigned_dm":
+				pref.AssignedDM = v
+			case "agent_clarification_dm":
+				pref.AgentClarificationDM = v
+			}
+		}
+	}
+	prefsJSON, err := json.Marshal(pref)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to marshal prefs")
 		return
@@ -268,5 +303,5 @@ func (h *Handler) PatchMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to update prefs")
 		return
 	}
-	writeJSON(w, http.StatusOK, incoming)
+	writeJSON(w, http.StatusOK, larkPrefToActiveMap(pref))
 }

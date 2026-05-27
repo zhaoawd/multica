@@ -635,16 +635,27 @@ func TestLarkThread_MirrorAgentComment_RepliesIntoThread(t *testing.T) {
 	if !strings.HasSuffix(capturedPath, "/im/v1/messages/"+rootMsgID+"/reply") {
 		t.Fatalf("reply went to %q, want anchor on root message id", capturedPath)
 	}
+	if capturedPayload["msg_type"] != "interactive" {
+		t.Fatalf("msg_type = %v, want interactive", capturedPayload["msg_type"])
+	}
 	contentStr, _ := capturedPayload["content"].(string)
-	var content struct{ Text string }
-	if err := json.Unmarshal([]byte(contentStr), &content); err != nil {
-		t.Fatalf("decode content: %v", err)
+	var card map[string]any
+	if err := json.Unmarshal([]byte(contentStr), &card); err != nil {
+		t.Fatalf("decode card content: %v", err)
 	}
-	if !strings.HasPrefix(content.Text, "[multica] CodexBot:") {
-		t.Fatalf("body missing prefix/author: %q", content.Text)
+	header, _ := card["header"].(map[string]any)
+	headerTitle, _ := header["title"].(map[string]any)
+	if title, _ := headerTitle["content"].(string); !strings.Contains(title, "CodexBot") {
+		t.Fatalf("card header missing agent name: %q", title)
 	}
-	if !strings.Contains(content.Text, "Should this column be UUID or ULID?") {
-		t.Fatalf("body missing question: %q", content.Text)
+	elements, _ := card["elements"].([]any)
+	if len(elements) == 0 {
+		t.Fatalf("card has no elements")
+	}
+	firstEl, _ := elements[0].(map[string]any)
+	mdContent, _ := firstEl["content"].(string)
+	if !strings.Contains(mdContent, "Should this column be UUID or ULID?") {
+		t.Fatalf("card body missing question: %q", mdContent)
 	}
 }
 
