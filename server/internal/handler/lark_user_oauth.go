@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -266,21 +267,25 @@ func (h *Handler) LarkUserOAuthCallback(w http.ResponseWriter, r *http.Request) 
 	code := q.Get("code")
 	state := q.Get("state")
 	if code == "" || state == "" {
+		slog.Warn("lark user oauth: missing params", "has_code", code != "", "has_state", state != "")
 		fail("", "missing_params")
 		return
 	}
 	userID, returnPath, ok := verifyLarkUserLinkState(state)
 	if !ok {
+		slog.Warn("lark user oauth: invalid state token")
 		fail("", "invalid_state")
 		return
 	}
 	userUUID, err := parseStrictUUID(userID)
 	if err != nil {
+		slog.Warn("lark user oauth: bad user id in state", "err", err, "user_id", userID)
 		fail(returnPath, "bad_user")
 		return
 	}
 	cfg := service.LarkConfigFromEnv()
 	if !cfg.Configured() {
+		slog.Warn("lark user oauth: lark integration not configured")
 		fail(returnPath, "not_configured")
 		return
 	}
@@ -288,6 +293,7 @@ func (h *Handler) LarkUserOAuthCallback(w http.ResponseWriter, r *http.Request) 
 	client := service.NewLarkClient(cfg)
 	result, err := client.ExchangeOIDCCode(r.Context(), code)
 	if err != nil {
+		slog.Warn("lark user oauth: code exchange failed", "err", err, "user_id", userID)
 		fail(returnPath, "exchange_failed")
 		return
 	}
