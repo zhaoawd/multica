@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -922,7 +923,11 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	var out struct {
+	// Lark currently has two coexisting response shapes for this endpoint:
+	//   v1 (wrapped): {"code":0,"msg":"","data":{"open_id":"...","access_token":"...",...}}
+	//   v2 (flat):    {"open_id":"...","access_token":"...","expires_in":...}
+	// We try v1 first; if Code==0 but Data.OpenID is empty, fall back to v2.
+	var wrapped struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 		Data struct {
@@ -935,20 +940,53 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 			AvatarURL    string `json:"avatar_url"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
+	if err := json.Unmarshal(raw, &wrapped); err != nil {
+		slog.Warn("lark oidc: bad response", "status", resp.StatusCode, "body", string(raw))
 		return LarkOIDCResult{}, fmt.Errorf("lark oidc: bad response (%d): %s", resp.StatusCode, string(raw))
 	}
-	if out.Code != 0 || out.Data.OpenID == "" {
-		return LarkOIDCResult{}, fmt.Errorf("lark oidc: code=%d msg=%s", out.Code, out.Msg)
+	if wrapped.Code != 0 {
+		slog.Warn("lark oidc: non-zero code", "status", resp.StatusCode, "code", wrapped.Code, "msg", wrapped.Msg, "body", string(raw))
+		return LarkOIDCResult{}, fmt.Errorf("lark oidc: code=%d msg=%s", wrapped.Code, wrapped.Msg)
+	}
+	if wrapped.Data.OpenID != "" {
+		return LarkOIDCResult{
+			OpenID:       wrapped.Data.OpenID,
+			UnionID:      wrapped.Data.UnionID,
+			AccessToken:  wrapped.Data.AccessToken,
+			RefreshToken: wrapped.Data.RefreshToken,
+			Name:         wrapped.Data.Name,
+			Email:        wrapped.Data.Email,
+			AvatarURL:    wrapped.Data.AvatarURL,
+		}, nil
+	}
+	// Fallback: v2 flat shape.
+	var flat struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		OpenID       string `json:"open_id"`
+		UnionID      string `json:"union_id"`
+		Name         string `json:"name"`
+		Email        string `json:"email"`
+		AvatarURL    string `json:"avatar_url"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
+	}
+	if err := json.Unmarshal(raw, &flat); err != nil {
+		slog.Warn("lark oidc: bad response (flat)", "status", resp.StatusCode, "body", string(raw))
+		return LarkOIDCResult{}, fmt.Errorf("lark oidc: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if flat.OpenID == "" {
+		slog.Warn("lark oidc: empty open_id", "status", resp.StatusCode, "error", flat.Error, "error_desc", flat.ErrorDesc, "body", string(raw))
+		return LarkOIDCResult{}, fmt.Errorf("lark oidc: empty open_id (%d): %s", resp.StatusCode, string(raw))
 	}
 	return LarkOIDCResult{
-		OpenID:       out.Data.OpenID,
-		UnionID:      out.Data.UnionID,
-		AccessToken:  out.Data.AccessToken,
-		RefreshToken: out.Data.RefreshToken,
-		Name:         out.Data.Name,
-		Email:        out.Data.Email,
-		AvatarURL:    out.Data.AvatarURL,
+		OpenID:       flat.OpenID,
+		UnionID:      flat.UnionID,
+		AccessToken:  flat.AccessToken,
+		RefreshToken: flat.RefreshToken,
+		Name:         flat.Name,
+		Email:        flat.Email,
+		AvatarURL:    flat.AvatarURL,
 	}, nil
 }
 
