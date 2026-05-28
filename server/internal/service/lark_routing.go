@@ -128,6 +128,8 @@ func DefaultLarkUserPref() LarkUserPref {
 	return LarkUserPref{
 		AssignedDM:           true,
 		AgentClarificationDM: true,
+		TaskCompletedDM:      true,
+		TaskFailedDM:         true,
 	}
 }
 

@@ -191,10 +191,12 @@ cases:
 
   # ── task:completed ───────────────────────────────────────────────
   - name: task_completed_pref_off
-    # Default OFF: most users won't see the card unless they opt in.
+    # Explicitly opted out.
     conditions:
       event: task:completed
       has_assignee: true
+      user_pref:
+        task_completed_dm: false
     expected:
       channels: []
       must_not_channels: [team, dm, thread_reply]
@@ -223,11 +225,12 @@ cases:
       must_not_channels: [dm, thread_reply]
 
   - name: task_failed_with_assignee_pref_off
-    # Default OFF: a task with an assignee fails silently from
-    # Lark's perspective; daemon auto-retries handle most cases.
+    # Explicitly opted out.
     conditions:
       event: task:failed
       has_assignee: true
+      user_pref:
+        task_failed_dm: false
     expected:
       channels: []
       must_not_channels: [team, dm, thread_reply]
