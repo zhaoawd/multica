@@ -45,6 +45,7 @@ const (
 	larkListMessagesPath    = "/im/v1/messages"
 	larkAuthorizeURL        = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
 	larkOIDCAccessTokenPath = "/authen/v1/oidc/access_token"
+	larkUserInfoPath        = "/authen/v1/user_info"
 	larkTokenSafetyMargin   = 60 * time.Second // refresh slightly before expiry
 	larkDefaultHTTPTimeout  = 10 * time.Second
 
@@ -923,10 +924,12 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	// Lark currently has two coexisting response shapes for this endpoint:
+	// Lark's OIDC access_token endpoint returns one of two shapes:
 	//   v1 (wrapped): {"code":0,"msg":"","data":{"open_id":"...","access_token":"...",...}}
 	//   v2 (flat):    {"open_id":"...","access_token":"...","expires_in":...}
-	// We try v1 first; if Code==0 but Data.OpenID is empty, fall back to v2.
+	// Some app configurations (e.g. scope=auth:user.id:read) return ONLY tokens
+	// in `data` with no open_id — in that case we follow up with /authen/v1/user_info
+	// using the user access_token to fetch the profile.
 	var wrapped struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -948,8 +951,8 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 		slog.Warn("lark oidc: non-zero code", "status", resp.StatusCode, "code", wrapped.Code, "msg", wrapped.Msg, "body", string(raw))
 		return LarkOIDCResult{}, fmt.Errorf("lark oidc: code=%d msg=%s", wrapped.Code, wrapped.Msg)
 	}
-	if wrapped.Data.OpenID != "" {
-		return LarkOIDCResult{
+	if wrapped.Data.AccessToken != "" {
+		result := LarkOIDCResult{
 			OpenID:       wrapped.Data.OpenID,
 			UnionID:      wrapped.Data.UnionID,
 			AccessToken:  wrapped.Data.AccessToken,
@@ -957,7 +960,29 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 			Name:         wrapped.Data.Name,
 			Email:        wrapped.Data.Email,
 			AvatarURL:    wrapped.Data.AvatarURL,
-		}, nil
+		}
+		if result.OpenID == "" {
+			info, err := c.fetchUserInfo(ctx, result.AccessToken)
+			if err != nil {
+				return LarkOIDCResult{}, err
+			}
+			result.OpenID = info.OpenID
+			result.UnionID = info.UnionID
+			if result.Name == "" {
+				result.Name = info.Name
+			}
+			if result.Email == "" {
+				result.Email = info.Email
+			}
+			if result.AvatarURL == "" {
+				result.AvatarURL = info.AvatarURL
+			}
+		}
+		if result.OpenID == "" {
+			slog.Warn("lark oidc: open_id missing after user_info", "body", string(raw))
+			return LarkOIDCResult{}, fmt.Errorf("lark oidc: open_id missing after user_info")
+		}
+		return result, nil
 	}
 	// Fallback: v2 flat shape.
 	var flat struct {
@@ -975,11 +1000,11 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 		slog.Warn("lark oidc: bad response (flat)", "status", resp.StatusCode, "body", string(raw))
 		return LarkOIDCResult{}, fmt.Errorf("lark oidc: bad response (%d): %s", resp.StatusCode, string(raw))
 	}
-	if flat.OpenID == "" {
-		slog.Warn("lark oidc: empty open_id", "status", resp.StatusCode, "error", flat.Error, "error_desc", flat.ErrorDesc, "body", string(raw))
-		return LarkOIDCResult{}, fmt.Errorf("lark oidc: empty open_id (%d): %s", resp.StatusCode, string(raw))
+	if flat.AccessToken == "" {
+		slog.Warn("lark oidc: empty access_token", "status", resp.StatusCode, "error", flat.Error, "error_desc", flat.ErrorDesc, "body", string(raw))
+		return LarkOIDCResult{}, fmt.Errorf("lark oidc: empty access_token (%d): %s", resp.StatusCode, string(raw))
 	}
-	return LarkOIDCResult{
+	result := LarkOIDCResult{
 		OpenID:       flat.OpenID,
 		UnionID:      flat.UnionID,
 		AccessToken:  flat.AccessToken,
@@ -987,6 +1012,76 @@ func (c *LarkClient) ExchangeOIDCCode(ctx context.Context, code string) (LarkOID
 		Name:         flat.Name,
 		Email:        flat.Email,
 		AvatarURL:    flat.AvatarURL,
+	}
+	if result.OpenID == "" {
+		info, err := c.fetchUserInfo(ctx, result.AccessToken)
+		if err != nil {
+			return LarkOIDCResult{}, err
+		}
+		result.OpenID = info.OpenID
+		result.UnionID = info.UnionID
+		if result.Name == "" {
+			result.Name = info.Name
+		}
+		if result.Email == "" {
+			result.Email = info.Email
+		}
+		if result.AvatarURL == "" {
+			result.AvatarURL = info.AvatarURL
+		}
+	}
+	if result.OpenID == "" {
+		slog.Warn("lark oidc: open_id missing after user_info (flat)", "body", string(raw))
+		return LarkOIDCResult{}, fmt.Errorf("lark oidc: open_id missing after user_info")
+	}
+	return result, nil
+}
+
+// fetchUserInfo calls /authen/v1/user_info with a user access_token to fetch
+// open_id and profile fields. Required when the access_token endpoint
+// returns only tokens (e.g. scope=auth:user.id:read).
+func (c *LarkClient) fetchUserInfo(ctx context.Context, userAccessToken string) (LarkOIDCResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBase+larkUserInfoPath, nil)
+	if err != nil {
+		return LarkOIDCResult{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+userAccessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return LarkOIDCResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			OpenID    string `json:"open_id"`
+			UnionID   string `json:"union_id"`
+			Name      string `json:"name"`
+			EnName    string `json:"en_name"`
+			Email     string `json:"email"`
+			AvatarURL string `json:"avatar_url"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		slog.Warn("lark user_info: bad response", "status", resp.StatusCode, "body", string(raw))
+		return LarkOIDCResult{}, fmt.Errorf("lark user_info: bad response (%d): %s", resp.StatusCode, string(raw))
+	}
+	if out.Code != 0 || out.Data.OpenID == "" {
+		slog.Warn("lark user_info: error", "status", resp.StatusCode, "code", out.Code, "msg", out.Msg, "body", string(raw))
+		return LarkOIDCResult{}, fmt.Errorf("lark user_info: code=%d msg=%s", out.Code, out.Msg)
+	}
+	name := out.Data.Name
+	if name == "" {
+		name = out.Data.EnName
+	}
+	return LarkOIDCResult{
+		OpenID:    out.Data.OpenID,
+		UnionID:   out.Data.UnionID,
+		Name:      name,
+		Email:     out.Data.Email,
+		AvatarURL: out.Data.AvatarURL,
 	}, nil
 }
 
