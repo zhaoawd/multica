@@ -212,13 +212,16 @@ func filterSupportedEvents(in []string) []string {
 // ── Per-user Lark notification preferences ────────────────────────────
 
 // larkActivePrefs is the whitelist of pref keys currently wired into
-// the routing function. task_completed_dm, task_failed_dm, and
-// mention_dm exist on LarkUserPref (and the routing golden tests
-// exercise them) but NotifyTaskCompleted / NotifyTaskFailed /
-// NotifyComment still use dispatch() → team chat. Exposing toggles
-// for them would mislead users into thinking they work. Add keys
-// here as the corresponding Notify methods migrate to dispatchRouted.
-var larkActivePrefs = []string{"assigned_dm", "agent_clarification_dm"}
+// the routing function. NotifyComment still uses dispatch() → team
+// chat, so mention_dm is intentionally omitted: exposing it would
+// mislead users into thinking it works. Add keys here as the
+// corresponding Notify methods migrate to dispatchRouted.
+var larkActivePrefs = []string{
+	"assigned_dm",
+	"agent_clarification_dm",
+	"task_completed_dm",
+	"task_failed_dm",
+}
 
 func loadLarkUserPref(ctx context.Context, q *db.Queries, userUUID pgtype.UUID) service.LarkUserPref {
 	raw, err := q.GetLarkUserPrefs(ctx, userUUID)
@@ -284,6 +287,10 @@ func (h *Handler) PatchMyLarkPrefs(w http.ResponseWriter, r *http.Request) {
 				pref.AssignedDM = v
 			case "agent_clarification_dm":
 				pref.AgentClarificationDM = v
+			case "task_completed_dm":
+				pref.TaskCompletedDM = v
+			case "task_failed_dm":
+				pref.TaskFailedDM = v
 			}
 		}
 	}

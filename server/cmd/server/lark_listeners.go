@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -13,6 +14,27 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+// larkNotifier is the subset of *service.LarkNotify used by the event
+// listeners. Extracted as an interface so tests can verify wiring without
+// constructing the full notifier (which needs DB, Lark config, workers).
+type larkNotifier interface {
+	NotifyIssueCreated(ctx context.Context, workspaceID string, info service.IssueInfo, hasAssignee bool, assigneeUserID string, hasLarkIssueLink bool, assigneeIsWorkspaceAgent bool, creatorName string)
+	NotifyIssueAssigned(ctx context.Context, workspaceID string, info service.IssueInfo, assigneeName string, assigneeUserID string, assigneeIsWorkspaceAgent bool)
+	PatchIssueTerminalCards(ctx context.Context, workspaceID string, info service.IssueInfo)
+	NotifyTaskCompleted(ctx context.Context, workspaceID string, info service.IssueInfo, hasAssignee bool, assigneeUserID string)
+	NotifyTaskFailed(ctx context.Context, workspaceID string, info service.IssueInfo, errSummary string, hasAssignee bool, assigneeUserID string)
+	NotifyComment(ctx context.Context, workspaceID string, info service.IssueInfo, authorName, excerpt string)
+	ResolveWorkspaceSlug(ctx context.Context, workspaceID string) string
+	ResolveIssueInfoByID(ctx context.Context, issueID string) (string, service.IssueInfo, bool)
+}
+
+// larkThreadMirror is the subset of *service.LarkThreadService used by
+// the thread-bridge event listener.
+type larkThreadMirror interface {
+	Configured() bool
+	MirrorAgentCommentToThread(ctx context.Context, issueID pgtype.UUID, authorName, content, issueURL string)
+}
 
 // registerLarkListeners wires the event bus to the Lark notifier.
 // Per the integration design (§3, §6.1) the bus is the only producer of
@@ -26,7 +48,7 @@ import (
 // Subscribe() entirely, but then enabling Lark would require a server
 // restart even if a binding is updated via the UI — accepting one extra
 // map lookup per event keeps the operator story simpler.)
-func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries *db.Queries) {
+func registerLarkListeners(bus *events.Bus, notify larkNotifier, queries *db.Queries) {
 	if notify == nil {
 		return
 	}
@@ -109,13 +131,16 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 	// task:completed and task:failed share the same payload shape (see
 	// service/task.go broadcastTaskEvent). We resolve issue context from
 	// issue_id when present; chat-only and quick-create tasks fall back to
-	// the workspace home link.
+	// the workspace home link. The assignee is resolved from the issue row
+	// so dispatchRouted can DM the right person.
 	bus.Subscribe(protocol.EventTaskCompleted, func(e events.Event) {
 		wsID, info := larkTaskIssue(notify, e)
 		if wsID == "" {
 			return
 		}
-		notify.NotifyTaskCompleted(context.Background(), wsID, info)
+		ctx := context.Background()
+		assigneeUserID, hasAssignee := larkTaskAssignee(ctx, queries, e.Payload)
+		notify.NotifyTaskCompleted(ctx, wsID, info, hasAssignee, assigneeUserID)
 	})
 	bus.Subscribe(protocol.EventTaskFailed, func(e events.Event) {
 		wsID, info := larkTaskIssue(notify, e)
@@ -123,6 +148,7 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 			return
 		}
 		ctx := context.Background()
+		assigneeUserID, hasAssignee := larkTaskAssignee(ctx, queries, e.Payload)
 		// task:failed payloads are inconsistent across producers:
 		//   - service.broadcastTaskEvent (the normal path) emits only
 		//     task_id / agent_id / issue_id / status — no error text.
@@ -130,7 +156,7 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 		// We try the payload first (cheap), then fall back to a
 		// GetAgentTask lookup so the card always carries some hint.
 		errSummary := larkTaskFailureSummary(ctx, queries, e.Payload)
-		notify.NotifyTaskFailed(ctx, wsID, info, errSummary)
+		notify.NotifyTaskFailed(ctx, wsID, info, errSummary, hasAssignee, assigneeUserID)
 	})
 
 	// comment:created → only when the comment @mentions a person or agent
@@ -173,7 +199,7 @@ func registerLarkListeners(bus *events.Bus, notify *service.LarkNotify, queries 
 // Filter: agent author only. Per the design's "agent 写 Q" semantics
 // (§6.6) — human comments in the multica UI are NOT mirrored, so a single
 // reviewer reading the issue page doesn't double-spam the Lark thread.
-func registerLarkThreadListeners(bus *events.Bus, larkThread *service.LarkThreadService, queries *db.Queries) {
+func registerLarkThreadListeners(bus *events.Bus, larkThread larkThreadMirror, queries *db.Queries) {
 	if larkThread == nil {
 		return
 	}
@@ -206,6 +232,9 @@ func registerLarkThreadListeners(bus *events.Bus, larkThread *service.LarkThread
 // larkBuildIssueURL constructs a deep-link to the issue for card buttons.
 // Returns "" on any resolution failure — callers omit the button.
 func larkBuildIssueURL(ctx context.Context, queries *db.Queries, issueID string) string {
+	if queries == nil {
+		return ""
+	}
 	issueUUID, err := util.ParseUUID(issueID)
 	if err != nil {
 		return ""
@@ -228,7 +257,7 @@ func larkBuildIssueURL(ctx context.Context, queries *db.Queries, issueID string)
 // larkIssueInfo projects an IssueResponse into the slug-aware IssueInfo
 // the notifier consumes. Falls back to whatever fields are non-empty so a
 // partially-populated payload still yields a usable card.
-func larkIssueInfo(ctx context.Context, notify *service.LarkNotify, queries *db.Queries, issue handler.IssueResponse) service.IssueInfo {
+func larkIssueInfo(ctx context.Context, notify larkNotifier, queries *db.Queries, issue handler.IssueResponse) service.IssueInfo {
 	slug := ""
 	if issue.WorkspaceID != "" {
 		slug = notify.ResolveWorkspaceSlug(ctx, issue.WorkspaceID)
@@ -262,7 +291,7 @@ func larkIssueInfo(ctx context.Context, notify *service.LarkNotify, queries *db.
 
 // larkTaskIssue resolves the workspace + issue for a task event using the
 // payload's issue_id (which broadcastTaskEvent always sets).
-func larkTaskIssue(notify *service.LarkNotify, e events.Event) (string, service.IssueInfo) {
+func larkTaskIssue(notify larkNotifier, e events.Event) (string, service.IssueInfo) {
 	issueID, _ := taskPayloadField(e.Payload, "issue_id")
 	if issueID == "" {
 		return e.WorkspaceID, service.IssueInfo{WorkspaceSlug: notify.ResolveWorkspaceSlug(context.Background(), e.WorkspaceID)}
@@ -272,6 +301,50 @@ func larkTaskIssue(notify *service.LarkNotify, e events.Event) (string, service.
 		return e.WorkspaceID, service.IssueInfo{WorkspaceSlug: notify.ResolveWorkspaceSlug(context.Background(), e.WorkspaceID)}
 	}
 	return wsID, info
+}
+
+// larkTaskAssignee resolves the issue's assignee from the task event
+// payload's issue_id. For local agent assignees it resolves the owner's
+// user ID so the DM reaches a human. Returns ("", false) when the issue
+// has no personal recipient (including workspace/cloud agents) or the
+// lookup fails — callers pass these through to dispatchRouted which
+// handles the no-assignee routing (e.g. team-chat public blocker for
+// task:failed).
+func larkTaskAssignee(ctx context.Context, queries *db.Queries, payload any) (userID string, hasAssignee bool) {
+	if queries == nil {
+		return "", false
+	}
+	issueID, ok := taskPayloadField(payload, "issue_id")
+	if !ok || issueID == "" {
+		return "", false
+	}
+	id, err := util.ParseUUID(issueID)
+	if err != nil {
+		return "", false
+	}
+	issue, err := queries.GetIssue(ctx, id)
+	if err != nil {
+		return "", false
+	}
+	if !issue.AssigneeID.Valid {
+		return "", false
+	}
+	assigneeID := util.UUIDToString(issue.AssigneeID)
+	if assigneeID == "" {
+		return "", false
+	}
+	assigneeType := ""
+	if issue.AssigneeType.Valid {
+		assigneeType = issue.AssigneeType.String
+	}
+	if assigneeType == "agent" {
+		ownerID, isWorkspaceAgent := larkResolveAgentOwner(ctx, queries, assigneeID)
+		if isWorkspaceAgent || ownerID == "" {
+			return "", false
+		}
+		return ownerID, true
+	}
+	return assigneeID, true
 }
 
 func taskPayloadField(payload any, key string) (string, bool) {
@@ -366,7 +439,7 @@ func hasUserMention(content string) bool {
 // Returns "" when the lookup fails; callers treat that as "render without
 // the byline" rather than failing the card.
 func larkActorName(ctx context.Context, queries *db.Queries, actorType, actorID string) string {
-	if actorID == "" {
+	if actorID == "" || queries == nil {
 		return ""
 	}
 	id, err := util.ParseUUID(actorID)

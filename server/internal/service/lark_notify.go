@@ -355,20 +355,34 @@ func (n *LarkNotify) buildIssueTerminalCard(info IssueInfo) map[string]any {
 	return buildCardWithElements(title, elements, []cardButton{{Text: "View", URL: n.IssueURL(info)}})
 }
 
-// NotifyTaskCompleted emits a "task completed" card. P1 doesn't yet link to
-// PRs (P3); we just show the issue with a view button.
-func (n *LarkNotify) NotifyTaskCompleted(ctx context.Context, workspaceID string, info IssueInfo) {
-	n.dispatch(ctx, workspaceID, protocol.EventTaskCompleted, func() any {
+// NotifyTaskCompleted emits a "task completed" card. Routing: DM to the
+// assignee when they have TaskCompletedDM enabled (default OFF). Silent
+// when there is no assignee or the pref is off — per §6.1 completed
+// tasks are personal signals, not team-broadcast.
+func (n *LarkNotify) NotifyTaskCompleted(ctx context.Context, workspaceID string, info IssueInfo, hasAssignee bool, assigneeUserID string) {
+	cond := LarkRoutingConditions{
+		Event:       protocol.EventTaskCompleted,
+		HasAssignee: hasAssignee,
+	}
+	n.dispatchRouted(ctx, workspaceID, protocol.EventTaskCompleted, assigneeUserID, cond, func(_ LarkChannel) larkRenderedCard {
 		title := fmt.Sprintf("✅ Task done: %s", info.Identifier)
-		return buildCard(title, info.Title, []cardButton{{Text: "View", URL: n.IssueURL(info)}})
+		return larkRenderedCard{
+			payload: buildCard(title, info.Title, []cardButton{{Text: "View", URL: n.IssueURL(info)}}),
+			issueID: info.IssueID,
+			kind:    LarkCardTaskCompleted,
+		}
 	})
 }
 
 // NotifyTaskFailed emits a "task failed" card with the error summary.
-// Card buttons in P1 are URL-only (no action.value) — Retry / Triage map
-// to opening the issue page; P2 wires the actual cardbacks.
-func (n *LarkNotify) NotifyTaskFailed(ctx context.Context, workspaceID string, info IssueInfo, errSummary string) {
-	n.dispatch(ctx, workspaceID, protocol.EventTaskFailed, func() any {
+// Routing: no assignee → team chat (public blocker); has assignee +
+// TaskFailedDM pref → DM; otherwise silent.
+func (n *LarkNotify) NotifyTaskFailed(ctx context.Context, workspaceID string, info IssueInfo, errSummary string, hasAssignee bool, assigneeUserID string) {
+	cond := LarkRoutingConditions{
+		Event:       protocol.EventTaskFailed,
+		HasAssignee: hasAssignee,
+	}
+	n.dispatchRouted(ctx, workspaceID, protocol.EventTaskFailed, assigneeUserID, cond, func(ch LarkChannel) larkRenderedCard {
 		title := fmt.Sprintf("❌ Task failed: %s", info.Identifier)
 		var elements []map[string]any
 		elements = append(elements, map[string]any{
@@ -382,7 +396,15 @@ func (n *LarkNotify) NotifyTaskFailed(ctx context.Context, workspaceID string, i
 				},
 			})
 		}
-		return buildCardWithElements(title, elements, []cardButton{{Text: "Open", URL: n.IssueURL(info)}})
+		kind := LarkCardTaskFailedPersonal
+		if ch == LarkChannelTeam {
+			kind = LarkCardPublicBlocker
+		}
+		return larkRenderedCard{
+			payload: buildCardWithElements(title, elements, []cardButton{{Text: "Open", URL: n.IssueURL(info)}}),
+			issueID: info.IssueID,
+			kind:    kind,
+		}
 	})
 }
 
@@ -486,30 +508,26 @@ func (n *LarkNotify) dispatchRouted(ctx context.Context, workspaceID string, eve
 			})
 
 		case LarkChannelDM:
+			// User not linked to Lark → silent degrade per the design
+			// spec (LARK_INTEGRATION_TEST.md §方向一/3). Falling back to
+			// team chat would broadcast intended-personal signals (e.g.
+			// task completed for assignee X) to the whole group, which
+			// is noise; users opt into DMs by linking, and absence of a
+			// link is itself the opt-out.
 			openID := n.resolveAssigneeLarkOpenID(ctx, assigneeUserID)
 			if openID == "" {
-				n.enqueue(ctx, larkJob{
-					targetID: binding.ChatID,
-					sendMode: larkSendChat,
-					card:     rendered.payload,
-					event:    eventKind,
-					wsID:     workspaceID,
-					issueID:  rendered.issueID,
-					channel:  LarkChannelTeam,
-					cardKind: rendered.kind,
-				})
-			} else {
-				n.enqueue(ctx, larkJob{
-					targetID: openID,
-					sendMode: larkSendDM,
-					card:     rendered.payload,
-					event:    eventKind,
-					wsID:     workspaceID,
-					issueID:  rendered.issueID,
-					channel:  LarkChannelDM,
-					cardKind: rendered.kind,
-				})
+				continue
 			}
+			n.enqueue(ctx, larkJob{
+				targetID: openID,
+				sendMode: larkSendDM,
+				card:     rendered.payload,
+				event:    eventKind,
+				wsID:     workspaceID,
+				issueID:  rendered.issueID,
+				channel:  LarkChannelDM,
+				cardKind: rendered.kind,
+			})
 
 		case LarkChannelThreadReply:
 			// Thread replies are handled by LarkThreadService separately.

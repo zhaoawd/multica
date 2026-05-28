@@ -882,5 +882,139 @@ func TestLarkWebhook_InboundReply_UnlinkedSenderSilentDrop(t *testing.T) {
 	}
 }
 
+// ── WebSocket transport bridge (lark_ws_bridge.go) ──────────────────────
+//
+// The HTTP webhook path and the WS long-connection path share the
+// transport-agnostic core (ProcessLarkMessageEvent / processLarkCardAction).
+// These tests drive the WS bridge entry points directly and assert the
+// same DB side-effects the HTTP path produces. Together with the field-
+// mapping tests in internal/service/lark_ws_test.go, they pin that
+// switching LARK_CALLBACK_MODE between http and websocket does not
+// change observable behavior for the message-receive verb path.
+
+func TestLarkWS_BridgeHandler_CreateIssueVerb_EndToEnd(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+
+	const openID = "ou_ws_bridge_create"
+	const chatID = "oc_ws_bridge_chat"
+	const triggerMsgID = "om_ws_bridge_trigger"
+	seedLarkChatBinding(t, chatID)
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO lark_user_link (user_id, lark_open_id) VALUES ($1, $2)`,
+		testUserID, openID); err != nil {
+		t.Fatalf("seed link: %v", err)
+	}
+
+	// Drive the WS bridge directly: this is what the long-connection
+	// client invokes on each im.message.receive_v1 frame.
+	handler := testHandler.NewLarkWSMessageHandler()
+	handler(context.Background(),
+		service.LarkWSSender{SenderType: "user", OpenID: openID},
+		service.LarkWSMessage{
+			MessageID:  triggerMsgID,
+			ChatID:     chatID,
+			ChatType:   "group",
+			MsgType:    "text",
+			Content:    `{"text":"@_user_1 创建任务 ship the ws bridge fix"}`,
+			CreateTime: "1747555200000",
+		},
+	)
+
+	var issueID, title string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT id, title FROM issue
+		 WHERE workspace_id = $1 AND creator_id::text = $2
+		 ORDER BY created_at DESC LIMIT 1`,
+		testWorkspaceID, testUserID).Scan(&issueID, &title); err != nil {
+		t.Fatalf("read back issue: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+	if title != "ship the ws bridge fix" {
+		t.Fatalf("title = %q", title)
+	}
+
+	var linkChatID, linkRoot string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT chat_id, root_message_id FROM lark_issue_link WHERE issue_id = $1`,
+		issueID).Scan(&linkChatID, &linkRoot); err != nil {
+		t.Fatalf("read back link: %v", err)
+	}
+	if linkChatID != chatID {
+		t.Errorf("link.chat_id = %q, want %q", linkChatID, chatID)
+	}
+	if linkRoot != triggerMsgID {
+		t.Errorf("link.root_message_id = %q, want %q", linkRoot, triggerMsgID)
+	}
+}
+
+// TestLarkWS_BridgeHandler_NonUserSender_Ignored — sender_type != "user"
+// must be dropped at the ProcessLarkMessageEvent guard. Pins that the
+// guard lives in the shared core, not the HTTP entry point — otherwise
+// the WS transport would expose a hole the HTTP path closed.
+func TestLarkWS_BridgeHandler_NonUserSender_Ignored(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+	withLarkWebhookEnv(t)
+	cleanupLarkUserLink(t)
+	installFakeLarkThreadService(t)
+	seedLarkChatBinding(t, "oc_ws_non_user")
+
+	// Snapshot issue count for this workspace before the call.
+	var before int
+	testPool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM issue WHERE workspace_id = $1`,
+		testWorkspaceID).Scan(&before)
+
+	handler := testHandler.NewLarkWSMessageHandler()
+	handler(context.Background(),
+		service.LarkWSSender{SenderType: "app", OpenID: "ou_bot_loopback"},
+		service.LarkWSMessage{
+			MessageID: "om_loopback",
+			ChatID:    "oc_ws_non_user",
+			MsgType:   "text",
+			Content:   `{"text":"@_user_1 创建任务 from-bot"}`,
+		},
+	)
+
+	var after int
+	testPool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM issue WHERE workspace_id = $1`,
+		testWorkspaceID).Scan(&after)
+	if after != before {
+		t.Errorf("non-user sender created %d issue(s); expected none", after-before)
+	}
+}
+
+// TestLarkWS_BridgeCardActionHandler_UnknownVerb_ErrorToast — drives
+// NewLarkWSCardActionHandler with a synthetic value map and asserts
+// the toast type/content surface back from the shared processor. Pins
+// that the WS card-action bridge (which fires only when a future SDK
+// version dispatches card frames — see comment in lark_ws.go) returns
+// (toastType, toastContent) matching processLarkCardAction.
+func TestLarkWS_BridgeCardActionHandler_UnknownVerb_ErrorToast(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("DB not available")
+	}
+
+	handler := testHandler.NewLarkWSCardActionHandler()
+	toastType, toastContent := handler(context.Background(), "ou_x", map[string]any{
+		// Missing verb / issue_id → error toast from the shared core.
+	})
+	if toastType != "error" {
+		t.Errorf("expected error toast; got type=%q content=%q", toastType, toastContent)
+	}
+	if !strings.Contains(toastContent, "verb") && !strings.Contains(toastContent, "issue") {
+		t.Errorf("toast content should mention missing field; got %q", toastContent)
+	}
+}
+
 // silence linter — pgtype is imported by the file via earlier tests.
 var _ = pgtype.Text{}

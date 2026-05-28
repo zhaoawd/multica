@@ -306,8 +306,9 @@ func (h *Handler) larkMarkIssueDoneCore(ctx context.Context, issue db.Issue) lar
 		return toastResponse("info", "Already done")
 	}
 	updated, err := h.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
-		ID:     issue.ID,
-		Status: "done",
+		ID:          issue.ID,
+		Status:      "done",
+		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil {
 		slog.Warn("lark webhook: mark done failed", "err", err, "issue_id", uuidToString(issue.ID))

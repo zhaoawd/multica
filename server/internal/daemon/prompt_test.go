@@ -327,6 +327,258 @@ func TestBuildPromptLinkedDocs_EmptyIsByteIdentical(t *testing.T) {
 	}
 }
 
+// TestBuildPromptLinkedDocs_ForbiddenError pins the placeholder shape for
+// the "forbidden" failure reason. The vocabulary lives in service.LinkedDoc
+// (forbidden / not_found / unavailable); the prompt builder renders each
+// the same way so the agent has a stable signal it can reason about.
+// Drifting the placeholder format silently degrades the agent's ability to
+// explain why a referenced doc is missing context.
+func TestBuildPromptLinkedDocs_ForbiddenError(t *testing.T) {
+	out := BuildPrompt(Task{
+		IssueID: "issue-1",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/Locked", Error: "forbidden"},
+		},
+	}, "claude")
+	for _, want := range []string{
+		"https://acme.feishu.cn/docx/Locked",
+		"[doc unavailable: forbidden]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("forbidden doc prompt missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildPromptLinkedDocs_UnavailableError pins the "unavailable" branch
+// (used for integration disabled, unsupported URL kinds like sheets/base, or
+// transient API failures). Same placeholder format as forbidden / not_found.
+func TestBuildPromptLinkedDocs_UnavailableError(t *testing.T) {
+	out := BuildPrompt(Task{
+		IssueID: "issue-1",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/sheets/SheetXyz", Error: "unavailable"},
+		},
+	}, "claude")
+	if !strings.Contains(out, "[doc unavailable: unavailable]") {
+		t.Errorf("unavailable doc prompt missing placeholder\n---\n%s", out)
+	}
+}
+
+// TestBuildPromptLinkedDocs_EmptyContent verifies the third placeholder
+// path: success fetch but empty body (a real Lark scenario for newly
+// created blank docs). The prompt must render "[doc is empty]" rather than
+// silently emit nothing — the agent still needs to acknowledge the URL was
+// referenced.
+func TestBuildPromptLinkedDocs_EmptyContent(t *testing.T) {
+	out := BuildPrompt(Task{
+		IssueID: "issue-1",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/Blank", Content: ""},
+		},
+	}, "claude")
+	for _, want := range []string{
+		"https://acme.feishu.cn/docx/Blank",
+		"[doc is empty]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("empty-content doc prompt missing %q\n---\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "[doc unavailable") {
+		t.Errorf("empty-content doc should not surface as unavailable\n---\n%s", out)
+	}
+}
+
+// TestBuildPromptLinkedDocs_MixedSuccessAndFailure verifies that a slice
+// containing every render branch — populated content, empty content,
+// forbidden, not_found, unavailable — produces one well-formed section per
+// doc in input order. Order preservation matters: the URLs come from
+// ExtractDocURLs which is order-of-first-appearance, and the agent reasons
+// about them positionally ("the spec doc is the first one referenced").
+func TestBuildPromptLinkedDocs_MixedSuccessAndFailure(t *testing.T) {
+	docs := []LinkedDoc{
+		{URL: "https://acme.feishu.cn/docx/A", Content: "Body of A"},
+		{URL: "https://acme.feishu.cn/docx/B", Error: "forbidden"},
+		{URL: "https://acme.feishu.cn/docx/C", Content: ""},
+		{URL: "https://acme.feishu.cn/wiki/D", Error: "not_found"},
+		{URL: "https://acme.feishu.cn/sheets/E", Error: "unavailable"},
+	}
+	out := BuildPrompt(Task{IssueID: "issue-1", LinkedDocs: docs}, "claude")
+
+	// Each URL appears exactly once with its expected body.
+	for _, want := range []string{
+		"### https://acme.feishu.cn/docx/A",
+		"Body of A",
+		"### https://acme.feishu.cn/docx/B",
+		"[doc unavailable: forbidden]",
+		"### https://acme.feishu.cn/docx/C",
+		"[doc is empty]",
+		"### https://acme.feishu.cn/wiki/D",
+		"[doc unavailable: not_found]",
+		"### https://acme.feishu.cn/sheets/E",
+		"[doc unavailable: unavailable]",
+	} {
+		if strings.Count(out, want) != 1 {
+			t.Errorf("expected exactly one occurrence of %q, got %d\n---\n%s", want, strings.Count(out, want), out)
+		}
+	}
+
+	// Order is preserved (A before B before C before D before E).
+	idxA := strings.Index(out, "/docx/A")
+	idxB := strings.Index(out, "/docx/B")
+	idxC := strings.Index(out, "/docx/C")
+	idxD := strings.Index(out, "/wiki/D")
+	idxE := strings.Index(out, "/sheets/E")
+	if !(idxA < idxB && idxB < idxC && idxC < idxD && idxD < idxE) {
+		t.Errorf("doc order not preserved: A=%d B=%d C=%d D=%d E=%d", idxA, idxB, idxC, idxD, idxE)
+	}
+
+	// The section is terminated by `---` so downstream prompt fragments
+	// (comment reply instructions, etc.) stay clearly separated.
+	if !strings.Contains(out, "---") {
+		t.Errorf("linked-docs section missing terminating separator\n---\n%s", out)
+	}
+}
+
+// TestBuildPromptLinkedDocs_SpecialCharacters verifies that doc content
+// containing markdown that overlaps with the prompt's own structure
+// (level-3 headings, fenced code blocks, table rows) is embedded verbatim
+// and does not corrupt the surrounding section. The risk is that a
+// content body emitting "### " or "---" could be mistaken for the next
+// linked-doc heading or the section terminator; in practice the agent
+// reads the whole block as one chunk and tolerates that, but we still
+// pin that the body survives byte-for-byte.
+func TestBuildPromptLinkedDocs_SpecialCharacters(t *testing.T) {
+	content := "## Inner heading\n" +
+		"\n" +
+		"Some prose with `inline code` and a [link](https://example.com).\n" +
+		"\n" +
+		"```go\n" +
+		"func main() {\n" +
+		"\tfmt.Println(\"hello\")\n" +
+		"}\n" +
+		"```\n" +
+		"\n" +
+		"| col1 | col2 |\n" +
+		"|------|------|\n" +
+		"| a    | b    |\n" +
+		"\n" +
+		"### A subsection that looks like a doc heading\n" +
+		"\n" +
+		"And a horizontal rule below:\n" +
+		"\n" +
+		"---\n"
+	out := BuildPrompt(Task{
+		IssueID: "issue-1",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/Rich", Content: content},
+			{URL: "https://acme.feishu.cn/docx/After", Content: "after marker"},
+		},
+	}, "claude")
+
+	// Body is embedded byte-for-byte.
+	if !strings.Contains(out, content) {
+		t.Errorf("rich-content body not embedded verbatim\n---\n%s", out)
+	}
+	// Both docs still render their own URL heading.
+	if !strings.Contains(out, "### https://acme.feishu.cn/docx/Rich") {
+		t.Errorf("rich-content doc heading missing\n---\n%s", out)
+	}
+	if !strings.Contains(out, "### https://acme.feishu.cn/docx/After") {
+		t.Errorf("trailing doc heading missing — rich content may have eaten it\n---\n%s", out)
+	}
+	// The second doc's body still renders, proving the rich content
+	// didn't truncate the loop.
+	if !strings.Contains(out, "after marker") {
+		t.Errorf("doc after rich content missing\n---\n%s", out)
+	}
+}
+
+// TestBuildPromptLinkedDocs_ContentNewlineNormalization verifies the
+// trailing-newline normalization branch: appendLinkedDocs appends "\n"
+// after a body that doesn't already end with one. This keeps section
+// spacing predictable regardless of whether Lark returned its raw_content
+// with or without a final newline.
+func TestBuildPromptLinkedDocs_ContentNewlineNormalization(t *testing.T) {
+	// Content without trailing newline → builder appends one + blank line.
+	out := BuildPrompt(Task{
+		IssueID: "issue-1",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/NoNL", Content: "no trailing newline"},
+			{URL: "https://acme.feishu.cn/docx/Next", Content: "next doc"},
+		},
+	}, "claude")
+	// The body, a newline, a blank line, then the next heading.
+	if !strings.Contains(out, "no trailing newline\n\n### https://acme.feishu.cn/docx/Next") {
+		t.Errorf("missing newline normalization after body without trailing \\n\n---\n%s", out)
+	}
+
+	// Content with trailing newline → builder does NOT double it.
+	out2 := BuildPrompt(Task{
+		IssueID: "issue-1",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/HasNL", Content: "has trailing newline\n"},
+			{URL: "https://acme.feishu.cn/docx/Next", Content: "next doc"},
+		},
+	}, "claude")
+	if strings.Contains(out2, "has trailing newline\n\n\n") {
+		t.Errorf("body with trailing \\n caused triple-newline (double normalization)\n---\n%s", out2)
+	}
+	if !strings.Contains(out2, "has trailing newline\n\n### https://acme.feishu.cn/docx/Next") {
+		t.Errorf("body with trailing \\n missing expected single blank-line gap to next heading\n---\n%s", out2)
+	}
+}
+
+// TestBuildPromptLinkedDocs_TitleFieldDoesNotBreak verifies that a
+// populated LinkedDoc.Title does not break rendering. The current
+// prompt builder doesn't surface Title in the prompt — this is a
+// tripwire: if a future change starts emitting Title, the test should
+// be updated to lock in the new shape, not silently fall through.
+func TestBuildPromptLinkedDocs_TitleFieldDoesNotBreak(t *testing.T) {
+	out := BuildPrompt(Task{
+		IssueID: "issue-1",
+		LinkedDocs: []LinkedDoc{
+			{URL: "https://acme.feishu.cn/docx/Titled", Title: "Spec: Auth Flow", Content: "body"},
+		},
+	}, "claude")
+	for _, want := range []string{
+		"https://acme.feishu.cn/docx/Titled",
+		"body",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("titled doc prompt missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildPromptLinkedDocs_BoundedSliceContract pins the contract
+// between the prompt builder and the server-side handler that supplies
+// LinkedDocs. The handler caps the slice at service.MaxDocsPerClaim (5)
+// before it ever reaches the daemon; the builder itself is unbounded and
+// will faithfully render whatever it's handed. This test confirms the
+// "render everything" half of that contract so a future regression that
+// silently drops docs in the builder cannot ship undetected — the cap
+// must remain at the call site, not the renderer.
+func TestBuildPromptLinkedDocs_BoundedSliceContract(t *testing.T) {
+	docs := make([]LinkedDoc, 8)
+	for i := range docs {
+		docs[i] = LinkedDoc{
+			URL:     "https://acme.feishu.cn/docx/Doc" + string(rune('A'+i)),
+			Content: "body " + string(rune('A'+i)),
+		}
+	}
+	out := BuildPrompt(Task{IssueID: "issue-1", LinkedDocs: docs}, "claude")
+	for _, d := range docs {
+		if !strings.Contains(out, d.URL) {
+			t.Errorf("builder dropped doc URL %q — cap must live at the handler, not the renderer\n---\n%s", d.URL, out)
+		}
+		if !strings.Contains(out, d.Content) {
+			t.Errorf("builder dropped doc body %q\n---\n%s", d.Content, out)
+		}
+	}
+}
+
 // TestBuildPromptNonSquadLeaderNoRule verifies that non-squad-leader agents
 // do NOT get the squad leader no_action rule injected.
 func TestBuildPromptNonSquadLeaderNoRule(t *testing.T) {
