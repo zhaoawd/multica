@@ -1,7 +1,11 @@
-# --- Dependencies ---
-FROM node:22-alpine AS deps
+# --- pnpm base ---
+FROM node:22-alpine AS pnpm-base
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+RUN corepack enable && corepack prepare pnpm@10.28.2 --activate && \
+    pnpm config set registry ${NPM_REGISTRY}
 
-RUN corepack enable && corepack prepare pnpm@10.28.2 --activate
+# --- Dependencies ---
+FROM pnpm-base AS deps
 
 WORKDIR /app
 
@@ -21,9 +25,7 @@ COPY packages/eslint-config/package.json packages/eslint-config/
 RUN pnpm install --frozen-lockfile
 
 # --- Build ---
-FROM node:22-alpine AS builder
-
-RUN corepack enable && corepack prepare pnpm@10.28.2 --activate
+FROM pnpm-base AS builder
 
 WORKDIR /app
 

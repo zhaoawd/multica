@@ -15,13 +15,17 @@ RUN cd server && go mod download
 # Copy server source
 COPY server/ ./server/
 
-# Build binaries
+# Build binaries in parallel
 ARG VERSION=dev
 ARG COMMIT=unknown
-RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" -o bin/server ./cmd/server
-RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" -o bin/multica ./cmd/multica
-RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w" -o bin/migrate ./cmd/migrate
-RUN cd server && CGO_ENABLED=0 go build -ldflags "-s -w" -o bin/backfill_task_usage_hourly ./cmd/backfill_task_usage_hourly
+RUN cd server && ( \
+    CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" -o bin/server ./cmd/server & p1=$!; \
+    CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" -o bin/multica ./cmd/multica & p2=$!; \
+    CGO_ENABLED=0 go build -ldflags "-s -w" -o bin/migrate ./cmd/migrate & p3=$!; \
+    CGO_ENABLED=0 go build -ldflags "-s -w" -o bin/backfill_task_usage_hourly ./cmd/backfill_task_usage_hourly & p4=$!; \
+    wait "$p1"; s1=$?; wait "$p2"; s2=$?; wait "$p3"; s3=$?; wait "$p4"; s4=$?; \
+    test "$s1" -eq 0 -a "$s2" -eq 0 -a "$s3" -eq 0 -a "$s4" -eq 0 \
+)
 
 # --- Runtime stage ---
 FROM alpine:3.21
